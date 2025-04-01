@@ -1,9 +1,11 @@
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 from sam2.build_sam import build_sam2
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from skimage.measure import perimeter
+from sklearn.cluster import KMeans
 
 
 class Segmenter:
@@ -188,44 +190,33 @@ class Segmenter:
 
     def get_best_point(self):
         """
-        Get the centroid of the largest unselected mask from the image.
-
-        Returns:
-            tuple: A (row, column) point representing the centroid of the largest unselected mask,
-                   or None if no valid mask is found.
+        Get the best point using the new point selection strategy with visualization.
         """
-
-        # Track the best candidate
-        largest_mask = None
-        largest_area = 0
-
-        # Iterate over all masks to find the largest unselected mask
+        if not hasattr(self, 'point_selector'):
+            self.point_selector = PointSelector(self.height, self.width)
+        
+        # Generate candidate points with visualization
+        candidates = self.point_selector.generate_candidates(
+            self.image,  # Pass the image for visualization
+            [m for m in self.masks if id(m) not in self.selected_masks],
+            visualize=False
+        )
+        
+        if len(candidates) == 0:
+            return None
+            
+        # For now, just return the first candidate
+        # This will be improved in the next steps with scoring
+        best_point = tuple(candidates[0])
+        
+        # Update selected masks (you'll need to modify this based on which mask contains the point)
         for mask in self.masks:
-            mask_id = id(mask)  # Use the mask's ID to uniquely identify it
-            if mask_id not in self.selected_masks:
-                mask_area = mask['area']  # Area of the mask
-                if mask_area > largest_area:
-                    largest_area = mask_area
-                    largest_mask = mask
-
-        if largest_mask is None:
-            print("No unselected masks available.")
-            return None  # No valid unselected masks found
-
-        # Calculate the centroid of the largest mask
-        segmentation = largest_mask['segmentation']
-        indices = list(zip(*segmentation.nonzero()))  # Get row, column indices of non-zero values
-        if not indices:
-            print("No valid pixels in the largest mask segmentation.")
-            return None  # Mask has no valid segmentation pixels
-
-        centroid = tuple(map(int, np.mean(indices, axis=0)))  # Compute centroid as (row, column)
-
-        # Add the largest mask to the selected set
-        self.selected_masks.add(id(largest_mask))
-
-        print(f"Selected centroid: {centroid} from the largest mask with area: {largest_area}")
-        return centroid
+            if id(mask) not in self.selected_masks:
+                if mask['segmentation'][best_point[0], best_point[1]]:
+                    self.selected_masks.add(id(mask))
+                    break
+        
+        return best_point
     
     def propagate_points(self, points, labels):
         """
@@ -259,3 +250,239 @@ class Segmenter:
         return masks[self._weighted_mask_selection(masks, scores)]
 
 
+class PointSelector:
+    def __init__(self, height, width, grid_size=8):
+        """
+        Initialize the point selector.
+        
+        Args:
+            height (int): Image height
+            width (int): Image width
+            grid_size (int): Number of grid cells in each dimension
+        """
+        self.height = height
+        self.width = width
+        self.grid_size = grid_size
+        self.grid_h = height // grid_size
+        self.grid_w = width // grid_size
+        self.selected_points = []  # Track selected points
+        self.selected_masks = set()  # Track selected mask IDs
+        
+    def update_selection_state(self, point, mask_id):
+        """
+        Update the selection state with a new point and its associated mask.
+        
+        Args:
+            point (tuple): (row, col) coordinates of selected point
+            mask_id (int): ID of the selected mask
+        """
+        self.selected_points.append(point)
+        self.selected_masks.add(mask_id)
+        
+    def _calculate_coverage_score(self, point):
+        """
+        Calculate how well a point covers the image based on existing selections.
+        
+        Args:
+            point (tuple): (row, col) coordinates of candidate point
+            
+        Returns:
+            float: Coverage score (lower is better)
+        """
+        if not self.selected_points:
+            return 0.0
+            
+        # Calculate distance to nearest selected point
+        min_dist = float('inf')
+        for selected_point in self.selected_points:
+            dist = np.sqrt((point[0] - selected_point[0])**2 + 
+                         (point[1] - selected_point[1])**2)
+            min_dist = min(min_dist, dist)
+            
+        # Normalize distance by image diagonal
+        max_dist = np.sqrt(self.height**2 + self.width**2)
+        return min_dist / max_dist
+        
+    def generate_candidates(self, image, masks, distance_threshold=50, visualize=True):
+        """
+        Generate and combine all candidate points with adaptive recalculation.
+        
+        Args:
+            image: Original RGB image
+            masks: List of SAM masks
+            distance_threshold: Minimum distance between points
+            visualize: Whether to show the visualization
+            
+        Returns:
+            np.array: Array of final candidate points
+        """
+        # Generate points from both sources
+        grid_points = self.generate_grid_points()
+        mask_points = self.generate_mask_points(masks)
+        
+        # Combine all points
+        all_points = np.vstack([grid_points, mask_points]) if len(mask_points) > 0 else grid_points
+        
+        # Calculate coverage scores for each point
+        coverage_scores = np.array([self._calculate_coverage_score(point) for point in all_points])
+        
+        # Adjust clustering based on coverage
+        if len(self.selected_points) > 0:
+            # If we have selected points, be more conservative with clustering
+            distance_threshold = min(150, distance_threshold * (1 + len(self.selected_points) * 0.1))
+        
+        # Cluster points to remove redundancy
+        final_points = self.cluster_points(all_points, distance_threshold=distance_threshold)
+        
+        # Sort final points by coverage score
+        final_scores = np.array([self._calculate_coverage_score(point) for point in final_points])
+        sorted_indices = np.argsort(final_scores)
+        final_points = final_points[sorted_indices]
+        
+        if visualize:
+            self.visualize_points(image, grid_points, mask_points, final_points)
+        
+        return final_points
+
+    def generate_grid_points(self):
+        """
+        Generate candidate points based on grid centers.
+        
+        Returns:
+            np.array: Array of (row, col) coordinates for grid centers
+        """
+        grid_points = []
+        
+        # Generate points at the center of each grid cell
+        for i in range(self.grid_size):
+            for j in range(self.grid_size):
+                # Calculate center of current grid cell
+                center_y = int((i + 0.5) * self.grid_h)
+                center_x = int((j + 0.5) * self.grid_w)
+                
+                # Ensure points are within image bounds
+                center_y = min(center_y, self.height - 1)
+                center_x = min(center_x, self.width - 1)
+                
+                grid_points.append([center_y, center_x])
+                
+        return np.array(grid_points)
+    
+    def generate_mask_points(self, masks):
+        """
+        Generate candidate points from mask centroids.
+        
+        Args:
+            masks (list): List of SAM masks, each with a 'segmentation' key
+            
+        Returns:
+            np.array: Array of (row, col) coordinates for mask centroids
+        """
+        mask_points = []
+        
+        for mask in masks:
+            segmentation = mask['segmentation']
+            indices = list(zip(*segmentation.nonzero()))
+            
+            if indices:
+                # Calculate centroid
+                centroid = np.mean(indices, axis=0)
+                mask_points.append([centroid[0], centroid[1]])
+        
+        return np.array(mask_points)
+    
+    def cluster_points(self, points, n_clusters=None, distance_threshold=50):
+        """
+        Cluster points to remove redundancy while preserving important centroids.
+        
+        Args:
+            points (np.array): Array of (row, col) coordinates
+            n_clusters (int, optional): Number of clusters. If None, calculated based on distance_threshold
+            distance_threshold (float): Minimum distance between points
+            
+        Returns:
+            np.array: Array of clustered points
+        """
+        if len(points) == 0:
+            return np.array([])
+            
+        # Increase the distance threshold to be more conservative
+        distance_threshold = 100  # Increased from 50 to 100
+        
+        if n_clusters is None:
+            # Estimate number of clusters based on image size and distance threshold
+            image_diagonal = np.sqrt(self.height**2 + self.width**2)
+            n_clusters = max(1, int(image_diagonal / distance_threshold))
+            n_clusters = min(n_clusters, len(points))
+        
+        # Perform clustering with more clusters to preserve more points
+        kmeans = KMeans(n_clusters=n_clusters, n_init=10)
+        kmeans.fit(points)
+        
+        # Get cluster centers
+        clustered_points = kmeans.cluster_centers_
+        
+        # Round to integer coordinates
+        clustered_points = np.round(clustered_points).astype(int)
+        
+        # Ensure points are within image bounds
+        clustered_points[:, 0] = np.clip(clustered_points[:, 0], 0, self.height - 1)
+        clustered_points[:, 1] = np.clip(clustered_points[:, 1], 0, self.width - 1)
+        
+        return clustered_points
+    
+    def visualize_points(self, image, grid_points=None, mask_points=None, final_points=None):
+        """
+        Visualize different stages of point generation on the image.
+        
+        Args:
+            image: Original RGB image
+            grid_points: Points generated from grid
+            mask_points: Points generated from mask centroids
+            final_points: Final clustered points
+        """
+        # Create a figure with subplots based on what we want to show
+        n_plots = 1 + (grid_points is not None) + (mask_points is not None) + (final_points is not None)
+        fig, axes = plt.subplots(1, n_plots, figsize=(5*n_plots, 5))
+        if n_plots == 1:
+            axes = [axes]
+
+        plot_idx = 0
+        
+        # Original image
+        axes[plot_idx].imshow(image)
+        axes[plot_idx].set_title('Original Image')
+        axes[plot_idx].axis('off')
+        
+        # Grid points
+        if grid_points is not None:
+            plot_idx += 1
+            axes[plot_idx].imshow(image)
+            axes[plot_idx].scatter(grid_points[:, 1], grid_points[:, 0], 
+                                 c='yellow', marker='+', s=100, label='Grid Points')
+            axes[plot_idx].set_title('Grid-based Points')
+            axes[plot_idx].axis('off')
+            axes[plot_idx].legend()
+
+        # Mask centroid points
+        if mask_points is not None:
+            plot_idx += 1
+            axes[plot_idx].imshow(image)
+            axes[plot_idx].scatter(mask_points[:, 1], mask_points[:, 0], 
+                                 c='red', marker='x', s=100, label='Mask Centroids')
+            axes[plot_idx].set_title('Mask Centroids')
+            axes[plot_idx].axis('off')
+            axes[plot_idx].legend()
+
+        # Final clustered points
+        if final_points is not None:
+            plot_idx += 1
+            axes[plot_idx].imshow(image)
+            axes[plot_idx].scatter(final_points[:, 1], final_points[:, 0], 
+                                 c='green', marker='*', s=200, label='Final Points')
+            axes[plot_idx].set_title('Final Clustered Points')
+            axes[plot_idx].axis('off')
+            axes[plot_idx].legend()
+
+        plt.tight_layout()
+        plt.show()
