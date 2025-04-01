@@ -95,34 +95,63 @@ class ImageViewer(QWidget):
         self.next_button.setFixedSize(200, 40)
         self.next_button.setEnabled(False)
 
-        # Layout for buttons (centered horizontally)
-        button_row_layout = QHBoxLayout()
-        button_row_layout.addStretch()
-        button_row_layout.addWidget(self.start_button)
-        button_row_layout.addWidget(self.next_button)
-        button_row_layout.addStretch()
+        # New buttons for point selection
+        self.switch_button = QPushButton("Negative", self)
+        self.switch_button.clicked.connect(self.switch_point_type)
+        self.switch_button.setFixedSize(150, 40)
+        self.switch_button.setEnabled(False)
+        self.switch_button.setStyleSheet("background-color: #FF0000; color: white;")  # Red background
 
-        # Main layout: image on top, buttons below
+        self.finish_button = QPushButton("Finish Points", self)
+        self.finish_button.clicked.connect(self.finish_points)
+        self.finish_button.setFixedSize(150, 40)
+        self.finish_button.setEnabled(False)
+
+        # Create a horizontal layout for the bottom buttons
+        bottom_button_layout = QHBoxLayout()
+        bottom_button_layout.addStretch()
+        bottom_button_layout.addWidget(self.start_button)
+        bottom_button_layout.addWidget(self.switch_button)
+        bottom_button_layout.addWidget(self.finish_button)
+        bottom_button_layout.addWidget(self.next_button)
+        bottom_button_layout.addStretch()
+
+        # Main layout: image on left, bottom buttons below
         main_layout = QVBoxLayout()
+        
+        # Create a horizontal layout for the top row (select folder button)
+        top_layout = QHBoxLayout()
+        top_layout.addWidget(self.select_button)
+        top_layout.addStretch()
+        
+        main_layout.addLayout(top_layout)
         main_layout.addWidget(self.image_label, alignment=Qt.AlignmentFlag.AlignCenter)
-        main_layout.addLayout(button_row_layout)
+        main_layout.addLayout(bottom_button_layout)
+        
         self.setLayout(main_layout)
 
         # Variables
         self.image_list = []
         self.current_index = 0
-        self.current_image = None  # Original image (RGB, NumPy array)
-        self.overlay_image = None # Image with all expanded masks
+        self.current_image = None
+        self.overlay_image = None
         self.displayed_pixmap = None
-        self.segmenter = None  # Segmenter instance
-        self.labels = {}  # Dictionary to store label names and QColor objects
-        self.expanded_masks = [] # List to store tuples: (mask, label, color)
-        self.combined_mask_overlay = None # For efficient display
+        self.segmenter = None
+        self.labels = {}
+        self.expanded_masks = []
+        self.combined_mask_overlay = None
 
         self.image_label.mouse_moved.connect(self.on_mouse_moved)
 
-        self.waiting_for_negative = False
-        self.positive_point = None
+        # New variables for multiple points
+        self.positive_points = []
+        self.negative_points = []
+        self.current_point_type = "positive"  # or "negative"
+        self.is_selecting_points = False
+
+        # Initially hide the point selection buttons
+        self.switch_button.hide()
+        self.finish_button.hide()
 
     def select_folder(self):
         folder = "/home/cesar/LabelExpansion/Datasets/MosaicsUCSD/train/images_prueba2"
@@ -145,8 +174,15 @@ class ImageViewer(QWidget):
         if not self.image_list or self.current_index >= len(self.image_list):
             return
         
-        # Enable image interactions
+        # Enable image interactions and show point selection buttons
         self.image_label.interactions_enabled = True
+        self.switch_button.show()
+        self.switch_button.setEnabled(False)  # Initially disabled
+        self.switch_button.setStyleSheet("background-color: #808080; color: white;")  # Gray background
+        self.finish_button.show()
+        self.finish_button.setEnabled(False)  # Will be enabled after first positive point
+        self.start_button.setEnabled(False)  # Disable Start button until Next Image is pressed
+        self.is_selecting_points = True
 
         # Create a modal progress dialog
         wait_dialog = QDialog(self)
@@ -191,70 +227,52 @@ class ImageViewer(QWidget):
             print("No valid point proposed.")
             self.suggested_point = None
         self.show_image(overlay_point=self.suggested_point)
-        # User will now click on the image to expand the mask
 
     def on_image_clicked(self, pos):
         if self.current_image is None or self.displayed_pixmap is None:
             return
 
         # Convert click position to image coordinates
-        label_width = self.image_label.width()
-        label_height = self.image_label.height()
-        pixmap_width = self.displayed_pixmap.width()
-        pixmap_height = self.displayed_pixmap.height()
-
-        offset_x = (label_width - pixmap_width) / 2
-        offset_y = (label_height - pixmap_height) / 2
-
-        click_x = pos.x()
-        click_y = pos.y()
-
-        if not (offset_x <= click_x <= offset_x + pixmap_width and offset_y <= click_y <= offset_y + pixmap_height):
-            print("Click outside the image area.")
+        current_point = self.get_image_coordinates(pos)
+        if current_point is None:
             return
 
-        original_h, original_w, _ = self.current_image.shape
-        ratio_x = original_w / pixmap_width
-        ratio_y = original_h / pixmap_height
-
-        orig_x = int((click_x - offset_x) * ratio_x)
-        orig_y = int((click_y - offset_y) * ratio_y)
-        current_point = (orig_x, orig_y)
-
-        if not self.waiting_for_negative:
-            # This is the first click (positive point)
-            self.positive_point = current_point
-            self.waiting_for_negative = True
-            print(f"Positive point selected at: {current_point}")
-            
-            # Show the positive point on the image
-            temp_image = self.overlay_image.copy() if self.overlay_image is not None else self.current_image.copy()
-            cv2.circle(temp_image, (orig_x, orig_y), 5, (0, 255, 0), -1)  # Green circle for positive
-            self.update_display(temp_image)
-            
+        # Add point to appropriate list
+        if self.current_point_type == "positive":
+            self.positive_points.append(current_point)
+            print(f"Positive point added at: {current_point}")
+            # Enable finish button and switch button after first positive point
+            self.finish_button.setEnabled(True)
+            self.switch_button.setEnabled(True)
+            self.switch_button.setStyleSheet("background-color: #FF0000; color: white;")  # Red background
         else:
-            # This is the second click (negative point)
-            print(f"Negative point selected at: {current_point}")
-            self.waiting_for_negative = False
-            
-            # Show both points before processing
-            temp_image = self.overlay_image.copy() if self.overlay_image is not None else self.current_image.copy()
-            first_x, first_y = self.positive_point  # Unpack the stored point correctly
-            cv2.circle(temp_image, (first_x, first_y), 5, (0, 255, 0), -1)  # Green for positive
-            cv2.circle(temp_image, (orig_x, orig_y), 5, (255, 0, 0), -1)  # Red for negative
-            self.update_display(temp_image)
+            self.negative_points.append(current_point)
+            print(f"Negative point added at: {current_point}")
 
-            # Process both points
-            points = np.array([self.positive_point, current_point])
-            labels = np.array([1, 0])  # 1 for positive, 0 for negative
-            
-            self.suggested_point = None
-            self.expansion_thread = MaskExpansionThread(self.segmenter, points, labels)
-            self.expansion_thread.result_ready.connect(self.on_mask_expansion_complete)
-            self.expansion_thread.start()
+        # Update display with all points
+        self.update_display_with_points()
 
+    def update_display_with_points(self):
+        """Update display showing all current points"""
+        temp_image = self.overlay_image.copy() if self.overlay_image is not None else self.current_image.copy()
 
-    def on_mask_expansion_complete(self, mask):
+        # Draw all positive points
+        for point in self.positive_points:
+            cv2.circle(temp_image, point, 5, (0, 255, 0), -1)  # Green for positive
+
+        # Draw all negative points
+        for point in self.negative_points:
+            cv2.circle(temp_image, point, 5, (255, 0, 0), -1)  # Red for negative
+
+        # Add suggested point if it exists
+        if hasattr(self, 'suggested_point') and self.suggested_point:
+            row, col = self.suggested_point
+            cv2.line(temp_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
+            cv2.line(temp_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+
+        self.update_display(temp_image)
+
+    def on_mask_expansion_complete(self, mask, stored_positive_points):
         if mask is None:
             print("No mask generated.")
             return
@@ -282,7 +300,18 @@ class ImageViewer(QWidget):
                 # Update display with the new combined overlay and suggested point
                 overlay_image = cv2.addWeighted(self.current_image, 1.0, self.combined_mask_overlay, 0.6, 0)
                 
-                # Make sure to get a new suggested point after adding a mask
+                # Update point selector with the selected points and mask
+                if hasattr(self, 'segmenter') and hasattr(self.segmenter, 'point_selector'):
+                    # Find the mask ID that contains our first positive point
+                    for mask_obj in self.segmenter.masks:
+                        if mask_obj['segmentation'][stored_positive_points[0][0], stored_positive_points[0][1]]:
+                            self.segmenter.point_selector.update_selection_state(
+                                stored_positive_points[0], 
+                                id(mask_obj)
+                            )
+                            break
+                
+                # Get new candidate points with updated state
                 if hasattr(self, 'segmenter'):
                     self.suggested_point = self.segmenter.get_best_point()
                 
@@ -302,16 +331,19 @@ class ImageViewer(QWidget):
 
     
     def dynamic_expand(self, pos):
-        if self.current_image is None or self.displayed_pixmap is None:
+        if not self.is_selecting_points or self.current_image is None or self.displayed_pixmap is None:
             return
 
         cursor_point = self.get_image_coordinates(pos)
         if cursor_point is None:
             return
 
-        # Single point expansion
-        points = np.array([cursor_point])
-        labels = np.array([1])
+        # Create points array with all current points plus cursor
+        points = np.array(self.positive_points + self.negative_points + [cursor_point])
+        
+        # Set cursor point label based on current point type
+        cursor_label = 0 if self.current_point_type == "negative" else 1
+        labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points) + [cursor_label])
         
         preview_mask = self.segmenter.propagate_points(points, labels)
 
@@ -326,10 +358,19 @@ class ImageViewer(QWidget):
             colored_preview[preview_mask > 0] = (128, 128, 128)  # Gray instead of green
             overlay_image = cv2.addWeighted(overlay_image, 1.0, colored_preview, 0.4, 0)
 
-        # Add suggested point if it exists - moved after all overlays
+        # Draw all current points
+        for point in self.positive_points:
+            cv2.circle(overlay_image, point, 4, (0, 255, 0), -1)  # Green for positive
+        for point in self.negative_points:
+            cv2.circle(overlay_image, point, 4, (255, 0, 0), -1)  # Red for negative
+
+        # Draw cursor point with appropriate color
+        cursor_color = (0, 255, 0) if self.current_point_type == "positive" else (255, 0, 0)
+        cv2.circle(overlay_image, cursor_point, 4, cursor_color, -1)
+
+        # Add suggested point if it exists
         if hasattr(self, 'suggested_point') and self.suggested_point:
             row, col = self.suggested_point
-            # Draw blue cross
             cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
             cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
 
@@ -344,7 +385,7 @@ class ImageViewer(QWidget):
             return
 
         # Two point expansion: fixed positive and moving negative
-        points = np.array([self.positive_point, cursor_point])
+        points = np.array([self.positive_points[0], cursor_point])
         labels = np.array([1, 0])
         
         preview_mask = self.segmenter.propagate_points(points, labels)
@@ -361,7 +402,7 @@ class ImageViewer(QWidget):
             overlay_image = cv2.addWeighted(overlay_image, 1.0, colored_preview, 0.4, 0)
         
         # Draw the points - moved after all overlays
-        pos_x, pos_y = self.positive_point
+        pos_x, pos_y = self.positive_points[0]
         cv2.circle(overlay_image, (pos_x, pos_y), 4, (0, 255, 0), -1)  # Green for positive
         cv2.circle(overlay_image, cursor_point, 4, (255, 0, 0), -1)  # Red for negative
 
@@ -409,7 +450,6 @@ class ImageViewer(QWidget):
         orig_y = int((pos.y() - offset_y) * ratio_y)
         
         return (orig_x, orig_y)
-
 
     def show_image(self, overlay_point=None):
         if not self.image_list or self.current_index >= len(self.image_list):
@@ -486,6 +526,11 @@ class ImageViewer(QWidget):
         self.overlay_image = None
         self.suggested_point = None
         
+        # Hide the point selection buttons and enable Start button
+        self.switch_button.hide()
+        self.finish_button.hide()
+        self.start_button.setEnabled(True)
+        
         # Move to next image
         self.current_index += 1
         
@@ -551,6 +596,46 @@ class ImageViewer(QWidget):
                 event.ignore()
         else:
             event.accept()
+
+    def switch_point_type(self):
+        """Switch between positive and negative point selection"""
+        if self.current_point_type == "positive":
+            self.current_point_type = "negative"
+            self.switch_button.setText("Positive")
+            self.switch_button.setStyleSheet("background-color: #00FF00; color: black;")  # Green background
+        else:
+            self.current_point_type = "positive"
+            self.switch_button.setText("Negative")
+            self.switch_button.setStyleSheet("background-color: #FF0000; color: white;")  # Red background
+
+    def finish_points(self):
+        """Finish adding points and proceed with mask expansion"""
+        if not self.positive_points:
+            return
+
+        # Store points before clearing them
+        stored_positive_points = self.positive_points.copy()
+        stored_negative_points = self.negative_points.copy()
+
+        # Convert points to numpy arrays
+        points = np.array(stored_positive_points + stored_negative_points)
+        labels = np.array([1] * len(stored_positive_points) + [0] * len(stored_negative_points))
+        
+        # Reset points for next mask
+        self.positive_points = []
+        self.negative_points = []
+        self.current_point_type = "positive"
+        self.switch_button.setText("Negative")
+        self.switch_button.setStyleSheet("background-color: #808080; color: white;")  # Gray background
+        self.switch_button.setEnabled(False)
+        self.finish_button.setEnabled(False)
+        self.is_selecting_points = False
+
+        # Process the points
+        self.suggested_point = None
+        self.expansion_thread = MaskExpansionThread(self.segmenter, points, labels)
+        self.expansion_thread.result_ready.connect(lambda mask: self.on_mask_expansion_complete(mask, stored_positive_points))
+        self.expansion_thread.start()
 
 # Run the application
 app = QApplication(sys.argv)
