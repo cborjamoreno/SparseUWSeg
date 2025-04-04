@@ -15,14 +15,15 @@ from sklearn.cluster import KMeans
 
 
 class Segmenter:
-    def __init__(self, image, checkpoint_path, model_config=None, device="cuda"):
+    def __init__(self, image, sam_checkpoint_path, sam2_checkpoint_path, sam2_config_path, device="cuda"):
         """
-        Initialize the Segmenter class, generate masks with SAM for the given image.
+        Initialize the Segmenter class, generate masks with SAM2 and use SAM for point prediction.
 
         Args:
             image (numpy.ndarray): Image as a NumPy array in RGB format.
-            checkpoint_path (str): Path to the SAM model checkpoint file.
-            model_config (str): Not used in this version, kept for compatibility.
+            sam_checkpoint_path (str): Path to the SAM model checkpoint file for point prediction.
+            sam2_checkpoint_path (str): Path to the SAM2 model checkpoint file for automatic mask generation.
+            sam2_config_path (str): Path to the SAM2 config file.
             device (str): Device to run the model on ("cuda" or "cpu").
         """
         # Check that the image is a valid NumPy array
@@ -33,55 +34,70 @@ class Segmenter:
 
         # Device setup (use GPU if available)
         self.device = "cuda" if torch.cuda.is_available() and device == "cuda" else "cpu"
-
-        # Load the SAM model
-        self.sam_model = self._load_sam_model(checkpoint_path, self.device)
-
-        # Initialize the SAM mask generator
-        self.mask_generator = SamAutomaticMaskGenerator(
-            model=self.sam_model,
-            points_per_side=64,
-            pred_iou_thresh=0.7,
-            stability_score_thresh=0.92,
-            stability_score_offset=0.7,
-            crop_n_layers=1,
-            box_nms_thresh=0.7,
-        )
-
+        
+        # Store checkpoint paths
+        self.sam_checkpoint_path = sam_checkpoint_path
+        self.sam2_checkpoint_path = sam2_checkpoint_path
+        self.sam2_config_path = sam2_config_path
+        
+        # Initialize models as None - they will be loaded when needed
+        self.sam_model = None
+        self.sam2_model = None
+        self.predictor = None
+        self.mask_generator = None
+        
+        # Initialize expanded areas mask
+        self.expanded_areas_mask = np.zeros((self.height, self.width), dtype=bool)
+        
         # Generate masks for the provided image
         self.masks = self._generate_masks()
+        print(f"Generated {len(self.masks)} masks")
 
         self.selected_masks = set()
-        
-        self.predictor = SamPredictor(self.sam_model)
-        self.predictor.set_image(image)
-
-    def _load_sam_model(self, checkpoint_path, device):
-        """
-        Load the SAM model.
-
-        Args:
-            checkpoint_path (str): Path to the SAM checkpoint.
-            device (str): Device to load the model on ("cuda" or "cpu").
-
-        Returns:
-            torch.nn.Module: Loaded SAM model.
-        """
-        print("Loading SAM model...")
-        sam = build_sam_vit_b(checkpoint=checkpoint_path)
-        sam.to(device)
-        print("SAM model loaded successfully.")
-        return sam
 
     def _generate_masks(self):
         """
-        Generate masks for the given image using SAM and filter out non-informative masks.
+        Generate masks for the given image using SAM2.
 
         Returns:
             list: List of generated masks for the image, excluding non-informative masks.
         """
         print("Generating masks for the provided image...")
-        masks = self.mask_generator.generate(self.image)
+        
+        # Load SAM2 model for mask generation
+        print("Loading SAM2 model for automatic mask generation...")
+
+        # Create autocast context manager
+        self.autocast_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        self.autocast_context.__enter__()
+
+        if torch.cuda.get_device_properties(0).major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        from sam2.build_sam import build_sam2
+        self.sam2_model = build_sam2(
+            self.sam2_config_path, self.sam2_checkpoint_path, device=self.device, apply_postprocessing=False
+        )
+
+        self.sam2_model.to(self.device)
+        print("SAM2 model loaded successfully.")
+        
+        # Initialize the SAM2 mask generator
+        from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+        self.mask_generator = SAM2AutomaticMaskGenerator(
+            model=self.sam2_model,
+            points_per_side=64,
+            points_per_patch=128,
+            pred_iou_threshold=0.7,
+            stability_score_thresh=0.92,
+            stability_score_offset=0.7,
+            crop_n_layers=1,
+            box_nms_thresh=0.7,
+        )
+        
+        # Generate masks
+        masks = self.mask_generator.generate(self.image)[0]
 
         # Image area (width x height)
         image_area = self.image.shape[0] * self.image.shape[1]
@@ -100,6 +116,69 @@ class Segmenter:
                 filtered_masks.append(mask)
 
         print(f"Detected {len(masks)} masks, kept {len(filtered_masks)} after filtering.")
+        
+        # Exit the autocast context
+        if hasattr(self, 'autocast_context'):
+            self.autocast_context.__exit__(None, None, None)
+            print("Exited autocast context")
+        
+        # Move SAM2 model to CPU to free GPU memory
+        if self.device == "cuda":
+            self.sam2_model.to("cpu")
+            torch.cuda.empty_cache()
+            print("Moved SAM2 model to CPU to free GPU memory")
+
+        # Load SAM model for point propagation if not already loaded
+        if self.sam_model is None:
+            print("Loading SAM model for point prediction...")
+            self.sam_model = build_sam_vit_b(checkpoint=self.sam_checkpoint_path)
+            self.sam_model.to(self.device)
+            print("SAM model loaded successfully.")
+            
+            # Initialize SAM predictor for point propagation
+            self.predictor = SamPredictor(self.sam_model)
+            self.predictor.set_image(self.image)
+        
+        # Predict expansion for each mask centroid and sort by predicted area
+        print("Predicting expansions for mask centroids...")
+        mask_info = []
+        for mask in filtered_masks:
+            segmentation = mask['segmentation']
+            indices = list(zip(*segmentation.nonzero()))
+            if indices:
+                # Calculate centroid in [y, x] format
+                centroid = np.mean(indices, axis=0)
+                # Convert to [x, y] format for prediction
+                point = np.array([[centroid[1], centroid[0]]])
+                labels = np.array([1])  # Positive point
+                
+                # Predict expansion for this centroid
+                masks, scores, logits = self.predictor.predict(
+                    point_coords=point,
+                    point_labels=labels,
+                    multimask_output=True,
+                )
+                
+                if masks is not None:
+                    # Get the best mask using weighted selection
+                    best_mask_idx = self._weighted_mask_selection(masks, scores)
+                    predicted_mask = masks[best_mask_idx]
+                    predicted_area = predicted_mask.sum()
+                    
+                    mask_info.append({
+                        'mask': mask,
+                        'centroid': centroid,  # Keep in [y, x] format for display
+                        'point': point[0],     # Store [x, y] format for prediction
+                        'area': predicted_area
+                    })
+        
+        # Sort masks by predicted area in descending order
+        mask_info.sort(key=lambda x: x['area'], reverse=True)
+        
+        # Update filtered_masks with sorted order
+        filtered_masks = [info['mask'] for info in mask_info]
+        print("Sorted masks by predicted expansion area")
+            
         return filtered_masks
 
     def _compute_mask_metrics(self, mask, score):
@@ -178,91 +257,59 @@ class Segmenter:
 
     def get_best_point(self):
         """
-        Get the best point using a simple approach:
-        1. Calculate centroid of each mask
-        2. Cluster very close centroids together
-        3. Select the centroid of the largest unselected mask
+        Get the best point by:
+        1. Use pre-sorted masks (sorted by predicted expansion area)
+        2. Compare predicted mask with the overall expanded areas mask using coverage percentage
+        3. Return the centroid of the first unselected mask that would expand to a sufficiently uncovered area
         """
         if not hasattr(self, 'selected_points'):
             self.selected_points = []
         
-        # Calculate centroids and areas for all unselected masks
-        mask_info = []
+        # Define coverage threshold (if more than 30% of the new mask is already covered, skip it)
+        COVERAGE_THRESHOLD = 0.3
+        
+        # Get centroid of first unselected mask that would expand to a sufficiently uncovered area
         for mask in self.masks:
             if id(mask) not in self.selected_masks:
                 segmentation = mask['segmentation']
                 indices = list(zip(*segmentation.nonzero()))
                 if indices:
+                    # Calculate centroid in [y, x] format for display
                     centroid = np.mean(indices, axis=0)
-                    area = mask['area']
-                    mask_info.append({
-                        'centroid': centroid,
-                        'area': area,
-                        'mask_id': id(mask)
-                    })
+                    
+                    # Convert to [x, y] format for prediction
+                    point = np.array([[centroid[1], centroid[0]]])
+                    labels = np.array([1])
+                    
+                    # Predict expansion for this centroid
+                    masks, scores, logits = self.predictor.predict(
+                        point_coords=point,
+                        point_labels=labels,
+                        multimask_output=True,
+                    )
+                    
+                    if masks is not None:
+                        best_mask_idx = self._weighted_mask_selection(masks, scores)
+                        predicted_mask = masks[best_mask_idx]
+                        
+                        # Calculate how much of the new mask is already covered
+                        # Count pixels that are in the new mask but not in the overall mask
+                        new_pixels = np.sum(predicted_mask)
+                        if new_pixels > 0:  # Avoid division by zero
+                            covered_pixels = np.sum(np.logical_and(predicted_mask, self.expanded_areas_mask))
+                            coverage_ratio = covered_pixels / new_pixels
+                            
+                            if coverage_ratio < COVERAGE_THRESHOLD:
+                                # Update selected masks and points
+                                self.selected_masks.add(id(mask))
+                                self.selected_points.append(centroid)
+                                return tuple(centroid.astype(int))
         
-        if not mask_info:
-            return None
-            
-        # Sort masks by area in descending order
-        mask_info.sort(key=lambda x: x['area'], reverse=True)
-
-        # display all the masks
-        
-        
-        # Simple clustering of very close centroids
-        min_distance = 20  # Minimum distance between centroids to consider them different
-        clustered_info = []
-        
-        for info in mask_info:
-            centroid = info['centroid']
-            # Check if this centroid is close to any already clustered centroid
-            merged = False
-            for cluster in clustered_info:
-                dist = np.sqrt(np.sum((centroid - cluster['centroid']) ** 2))
-                if dist < min_distance:
-                    # Merge with existing cluster (weighted average by area)
-                    total_area = cluster['area'] + info['area']
-                    cluster['centroid'] = (cluster['centroid'] * cluster['area'] + 
-                                         centroid * info['area']) / total_area
-                    cluster['area'] = total_area
-                    cluster['mask_ids'].add(info['mask_id'])
-                    merged = True
-                    break
-            
-            if not merged:
-                # Create new cluster
-                clustered_info.append({
-                    'centroid': centroid,
-                    'area': info['area'],
-                    'mask_ids': {info['mask_id']}
-                })
-        
-        # Find the first cluster that's far enough from all selected points
-        min_selection_distance = 50  # Minimum distance from previously selected points
-        
-        for cluster in clustered_info:
-            centroid = cluster['centroid']
-            # Check distance to all previously selected points
-            too_close = False
-            for selected_point in self.selected_points:
-                dist = np.sqrt(np.sum((centroid - selected_point) ** 2))
-                if dist < min_selection_distance:
-                    too_close = True
-                    break
-            
-            if not too_close:
-                # Found a good point, update selected masks and points
-                self.selected_masks.update(cluster['mask_ids'])
-                self.selected_points.append(centroid)
-                return tuple(centroid.astype(int))
-        
-        # If we couldn't find a point far enough from selected points
         return None
     
     def propagate_points(self, points, labels):
         """
-        Propagate points into a mask
+        Propagate points into a mask using SAM
 
         Args:
             points: Point prompt coordinates
@@ -271,14 +318,61 @@ class Segmenter:
         Returns:
             np.array: Mask propagated from points.
         """
-
+        
+        # Convert points and labels to the correct format
+        # The predictor expects NumPy arrays, not PyTorch tensors
+        if isinstance(points, torch.Tensor):
+            points = points.cpu().numpy()
+        if isinstance(labels, torch.Tensor):
+            labels = labels.cpu().numpy()
+        
+        # Ensure points and labels are in the correct shape
+        if len(points.shape) == 1:
+            points = points.reshape(1, -1)
+        if len(labels.shape) == 0:
+            labels = labels.reshape(1)
+        
         masks, scores, logits = self.predictor.predict(
             point_coords=points,
             point_labels=labels,
             multimask_output=True,
         )
 
-        return masks[self._weighted_mask_selection(masks, scores)]
+        predicted_mask = masks[self._weighted_mask_selection(masks, scores)]
+        
+        # Update the expanded areas mask with the new predicted mask
+        self.expanded_areas_mask = np.logical_or(self.expanded_areas_mask, predicted_mask)
+        
+        return predicted_mask
+    
+    def cleanup(self):
+        """
+        Clean up resources by moving models to CPU and clearing GPU memory.
+        This should be called when switching to a new image.
+        """
+        if self.device == "cuda":
+            # Move SAM model to CPU if it exists
+            if self.sam_model is not None:
+                self.sam_model.to("cpu")
+                print("Moved SAM model to CPU")
+            
+            # Move SAM2 model to CPU if it exists
+            if self.sam2_model is not None:
+                self.sam2_model.to("cpu")
+                print("Moved SAM2 model to CPU")
+            
+            # Clear GPU memory
+            torch.cuda.empty_cache()
+            print("Cleared GPU memory")
+
+    def initialize_sam_predictor(self):
+        """Initialize the SAM predictor after generating automatic masks"""
+        if self.sam_model is None:
+            self.sam_model = build_sam_vit_b(checkpoint=self.sam_checkpoint_path)
+            self.sam_model.to(self.device)
+            self.sam_model.eval()
+            self.predictor = SamPredictor(self.sam_model)
+            self.predictor.set_image(self.image)
 
 
 class PointSelector:

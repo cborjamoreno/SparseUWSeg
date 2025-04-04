@@ -315,9 +315,9 @@ class ImageViewer(QWidget):
         wait_dialog.exec()
 
     def initialize_segmenter_and_start_thread(self, wait_dialog):
-        # sam2_checkpoint = "checkpoints/sam2.1_hiera_large.pt"
-        sam2_checkpoint = "checkpoints/vit_b_coralscop.pth"
-        model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        sam2_checkpoint = "checkpoints/sam2.1_hiera_large.pt"
+        sam_checkpoint = "checkpoints/vit_b_coralscop.pth"
+        sam2_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
         current_image_path = self.image_list[self.current_index]
 
         image = cv2.imread(current_image_path)
@@ -325,7 +325,7 @@ class ImageViewer(QWidget):
         self.current_image = image
 
         if self.segmenter is None:
-            self.segmenter = Segmenter(self.current_image, sam2_checkpoint, model_cfg)
+            self.segmenter = Segmenter(self.current_image, sam_checkpoint, sam2_checkpoint, sam2_cfg)
 
         self.masking_thread = MaskingThread(self.segmenter)
         self.masking_thread.result_ready.connect(lambda best_point: self.on_masking_complete(best_point, wait_dialog))
@@ -501,6 +501,13 @@ class ImageViewer(QWidget):
                 overlay_image = self.current_image.copy()
                 if self.combined_mask_overlay is not None:
                     overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.6, 0)
+                
+                # Add suggested point if it exists
+                if hasattr(self, 'suggested_point') and self.suggested_point:
+                    row, col = self.suggested_point
+                    cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
+                    cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+                
                 self.update_display(overlay_image)
 
     def dynamic_expand(self, pos):
