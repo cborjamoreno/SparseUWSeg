@@ -62,7 +62,7 @@ class MaskExpansionThread(QThread):
         self.labels = labels
 
     def run(self):
-        mask = self.segmenter.propagate_points(self.points, self.labels)
+        mask = self.segmenter.propagate_points(self.points, self.labels, update_expanded_mask=True)
         self.result_ready.emit(mask)
 
 
@@ -391,7 +391,7 @@ class ImageViewer(QWidget):
         if self.positive_points or self.negative_points:
             points = np.array(self.positive_points + self.negative_points)
             labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points))
-            preview_mask = self.segmenter.propagate_points(points, labels)
+            preview_mask = self.segmenter.propagate_points(points, labels, update_expanded_mask=False)
             
             if preview_mask is not None:
                 colored_preview = np.zeros_like(overlay_image)
@@ -470,7 +470,7 @@ class ImageViewer(QWidget):
             if self.positive_points or self.negative_points:
                 points = np.array(self.positive_points + self.negative_points)
                 labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points))
-                preview_mask = self.segmenter.propagate_points(points, labels)
+                preview_mask = self.segmenter.propagate_points(points, labels, update_expanded_mask=False)
                 
                 # Start with original image and add cached overlay if it exists
                 overlay_image = self.current_image.copy()
@@ -542,7 +542,7 @@ class ImageViewer(QWidget):
                 points = np.array(self.positive_points + self.negative_points + [cursor_point])
                 cursor_label = 0 if self.current_point_type == "negative" else 1
                 labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points) + [cursor_label])
-                preview_mask = self.segmenter.propagate_points(points, labels)
+                preview_mask = self.segmenter.propagate_points(points, labels, update_expanded_mask=False)
 
                 # Add the preview mask if it exists
                 if preview_mask is not None:
@@ -558,7 +558,7 @@ class ImageViewer(QWidget):
             if self.positive_points or self.negative_points:
                 points = np.array(self.positive_points + self.negative_points)
                 labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points))
-                preview_mask = self.segmenter.propagate_points(points, labels)
+                preview_mask = self.segmenter.propagate_points(points, labels, update_expanded_mask=False)
                 if preview_mask is not None:
                     colored_preview = np.zeros_like(overlay_image)
                     colored_preview[preview_mask > 0] = (128, 128, 128)  # Gray instead of green
@@ -584,7 +584,7 @@ class ImageViewer(QWidget):
         points = np.array([self.positive_points[0], cursor_point])
         labels = np.array([1, 0])
         
-        preview_mask = self.segmenter.propagate_points(points, labels)
+        preview_mask = self.segmenter.propagate_points(points, labels, update_expanded_mask=False)
         
         # Start with original image and add cached overlay if it exists
         overlay_image = self.current_image.copy()

@@ -264,56 +264,110 @@ class Segmenter:
         """
         if not hasattr(self, 'selected_points'):
             self.selected_points = []
+        if not hasattr(self, 'rejected_masks'):
+            self.rejected_masks = set()
         
         # Define coverage threshold (if more than 30% of the new mask is already covered, skip it)
         COVERAGE_THRESHOLD = 0.3
+        # Define distance threshold for skipping nearby points (3 pixels)
+        DISTANCE_THRESHOLD = 5
         
         # Get centroid of first unselected mask that would expand to a sufficiently uncovered area
         for mask in self.masks:
-            if id(mask) not in self.selected_masks:
-                segmentation = mask['segmentation']
-                indices = list(zip(*segmentation.nonzero()))
-                if indices:
-                    # Calculate centroid in [y, x] format for display
-                    centroid = np.mean(indices, axis=0)
+            # Skip if mask is already selected or rejected
+            if id(mask) in self.selected_masks or id(mask) in self.rejected_masks:
+                continue
+                
+            segmentation = mask['segmentation']
+            indices = list(zip(*segmentation.nonzero()))
+            if indices:
+                # Calculate centroid in [y, x] format for display
+                centroid = np.mean(indices, axis=0)
+                
+                # Skip if centroid is too close to any already selected point
+                is_near_selected = False
+                for selected_point in self.selected_points:
+                    distance = np.sqrt(np.sum((centroid - selected_point) ** 2))
+                    if distance <= DISTANCE_THRESHOLD:
+                        is_near_selected = True
+                        break
+                
+                if is_near_selected:
+                    print(f"Skipping mask at centroid ({int(centroid[0])}, {int(centroid[1])}) - too close to selected point")
+                    self.rejected_masks.add(id(mask))
+                    continue
+                
+                # Convert to [x, y] format for prediction
+                point = np.array([[centroid[1], centroid[0]]])
+                labels = np.array([1])
+                
+                # Predict expansion for this centroid
+                masks, scores, logits = self.predictor.predict(
+                    point_coords=point,
+                    point_labels=labels,
+                    multimask_output=True,
+                )
+                
+                if masks is not None:
+                    best_mask_idx = self._weighted_mask_selection(masks, scores)
+                    predicted_mask = masks[best_mask_idx]
                     
-                    # Convert to [x, y] format for prediction
-                    point = np.array([[centroid[1], centroid[0]]])
-                    labels = np.array([1])
-                    
-                    # Predict expansion for this centroid
-                    masks, scores, logits = self.predictor.predict(
-                        point_coords=point,
-                        point_labels=labels,
-                        multimask_output=True,
-                    )
-                    
-                    if masks is not None:
-                        best_mask_idx = self._weighted_mask_selection(masks, scores)
-                        predicted_mask = masks[best_mask_idx]
+                    # Calculate how much of the new mask is already covered
+                    # Count pixels that are in the new mask but not in the overall mask
+                    new_pixels = np.sum(predicted_mask)
+                    if new_pixels > 0:  # Avoid division by zero
+                        covered_pixels = np.sum(np.logical_and(predicted_mask, self.expanded_areas_mask))
+                        coverage_ratio = covered_pixels / new_pixels
                         
-                        # Calculate how much of the new mask is already covered
-                        # Count pixels that are in the new mask but not in the overall mask
-                        new_pixels = np.sum(predicted_mask)
-                        if new_pixels > 0:  # Avoid division by zero
-                            covered_pixels = np.sum(np.logical_and(predicted_mask, self.expanded_areas_mask))
-                            coverage_ratio = covered_pixels / new_pixels
+                        if coverage_ratio >= COVERAGE_THRESHOLD:
+                            # Add to rejected masks and continue to next mask
+                            self.rejected_masks.add(id(mask))
+                            print(f"Skipping mask at centroid ({int(centroid[0])}, {int(centroid[1])})")
+                            print(f"Coverage ratio: {coverage_ratio:.2%}")
+                            print(f"New pixels: {new_pixels}, Covered pixels: {covered_pixels}")
                             
-                            if coverage_ratio < COVERAGE_THRESHOLD:
-                                # Update selected masks and points
-                                self.selected_masks.add(id(mask))
-                                self.selected_points.append(centroid)
-                                return tuple(centroid.astype(int))
+                            # Create visualization for skipped masks
+                            plt.figure(figsize=(15, 5))
+                            
+                            # Original image with centroid
+                            plt.subplot(131)
+                            plt.imshow(self.image)
+                            plt.plot(centroid[1], centroid[0], 'r+', markersize=10)
+                            plt.title('Centroid Location')
+                            
+                            # Predicted mask
+                            plt.subplot(132)
+                            plt.imshow(predicted_mask, cmap='gray')
+                            plt.title('Predicted Mask')
+                            
+                            # Overlap with expanded areas
+                            plt.subplot(133)
+                            overlap = np.logical_and(predicted_mask, self.expanded_areas_mask)
+                            plt.imshow(overlap, cmap='gray')
+                            plt.title('Overlap with Expanded Areas')
+                            
+                            plt.tight_layout()
+                            plt.show()
+                            
+                            continue
+                        
+                        # If we get here, the mask is valid
+                        self.selected_masks.add(id(mask))
+                        self.selected_points.append(centroid)
+                        return tuple(centroid.astype(int))
         
         return None
     
-    def propagate_points(self, points, labels):
+    def propagate_points(self, points, labels, update_expanded_mask=True):
         """
         Propagate points into a mask using SAM
 
         Args:
             points: Point prompt coordinates
             labels: Point prompt labels. 1 if positive, 0 if negative.
+            update_expanded_mask (bool): Whether to update the expanded_areas_mask. 
+                                       Should be True only for actual point predictions, 
+                                       False for dynamic expansion visualization.
 
         Returns:
             np.array: Mask propagated from points.
@@ -340,8 +394,10 @@ class Segmenter:
 
         predicted_mask = masks[self._weighted_mask_selection(masks, scores)]
         
-        # Update the expanded areas mask with the new predicted mask
-        self.expanded_areas_mask = np.logical_or(self.expanded_areas_mask, predicted_mask)
+        # Only update the expanded areas mask if this is an actual point prediction
+        if update_expanded_mask:
+            self.expanded_areas_mask = np.logical_or(self.expanded_areas_mask, predicted_mask)
+            print(f"Updated expanded areas mask. New total area: {np.sum(self.expanded_areas_mask)} pixels")
         
         return predicted_mask
     
