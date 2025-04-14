@@ -1,10 +1,20 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, 
     QPushButton, QListWidget, QColorDialog, QListWidgetItem,
-    QStyledItemDelegate, QStyle
+    QStyledItemDelegate, QStyle, QGridLayout
 )
 from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtCore import Qt
+
+# Add the load_stylesheet function
+def load_stylesheet(file_path):
+    """Load stylesheet from a file"""
+    try:
+        with open(file_path, 'r') as f:
+            return f.read()
+    except Exception as e:
+        print(f"Error loading stylesheet: {e}")
+        return ""
 
 class ColoredItemDelegate(QStyledItemDelegate):
     def is_dark_color(self, color):
@@ -56,6 +66,10 @@ class LabelDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(300)  # Set a minimum width for better visibility
 
+        # Load the stylesheet
+        stylesheet = load_stylesheet("button_styles.qss")
+        self.setStyleSheet(stylesheet)
+
         # Store the labels dictionary
         self.labels = existing_labels
         self.selected_label = None
@@ -64,13 +78,17 @@ class LabelDialog(QDialog):
         # Create widgets
         layout = QVBoxLayout()
 
-        # Buttons
+        # Buttons with QSS classes
         button_layout = QHBoxLayout()
         self.ok_button = QPushButton("OK")
         self.ok_button.clicked.connect(self.accept)
         self.ok_button.setEnabled(False)  # Start with OK button disabled
+        self.ok_button.setProperty("class", "start-button")  # Use blue style for OK button
+        
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
+        cancel_button.setProperty("class", "select-folder-button")  # Use neutral style for Cancel
+        
         button_layout.addWidget(self.ok_button)
         button_layout.addWidget(cancel_button)
 
@@ -91,8 +109,11 @@ class LabelDialog(QDialog):
         self.new_label_edit = QLineEdit()
         self.new_label_edit.setPlaceholderText("Enter new label name")
         self.new_label_edit.textChanged.connect(self.on_text_changed)
+        
         self.color_button = QPushButton("Choose Color")
         self.color_button.clicked.connect(self.choose_color)
+        self.color_button.setProperty("class", "select-folder-button")  # Use white style instead of orange
+        
         new_label_layout.addWidget(self.new_label_edit)
         new_label_layout.addWidget(self.color_button)
 
@@ -139,10 +160,11 @@ class LabelDialog(QDialog):
             self.selected_label = None
 
     def choose_color(self):
-        """Open color picker dialog with distinct predefined colors"""
+        """Open QColorDialog with customized basic colors"""
+        # Create standard color dialog
         color_dialog = QColorDialog(self)
         
-        # Define a set of distinct colors (RGB values)
+        # Define our distinct colors
         distinct_colors = [
             QColor(255, 0, 0),      # Red
             QColor(0, 255, 0),      # Green
@@ -161,21 +183,45 @@ class LabelDialog(QDialog):
             QColor(128, 128, 255),  # Light Blue
         ]
         
-        # Set the custom color options
-        color_dialog.setCustomColor(0, distinct_colors[0])
-        for i, color in enumerate(distinct_colors):
-            color_dialog.setCustomColor(i, color)
+        # Use the Qt dialog instead of native dialog
+        color_dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
         
-        # Show the dialog and get the selected color
+        # Clear all standard colors (set to white or transparent)
+        for i in range(48):
+            color_dialog.setStandardColor(i, QColor(255, 255, 255, 0).rgb())
+        
+        # Set our distinct colors as the standard colors
+        for i, color in enumerate(distinct_colors):
+            if i < 48:  # Safety check
+                color_dialog.setStandardColor(i, color.rgb())
+        
+        # Show the dialog
         if color_dialog.exec() == QColorDialog.DialogCode.Accepted:
-            self.chosen_color = color_dialog.selectedColor()
+            self.chosen_color = color_dialog.currentColor()
+            r, g, b = self.chosen_color.red(), self.chosen_color.green(), self.chosen_color.blue()
+            
+            # Use a border and background to show the color
+            self.color_button.setText("Color Selected")
             self.color_button.setStyleSheet(
-                f"background-color: rgb({self.chosen_color.red()}, {self.chosen_color.green()}, {self.chosen_color.blue()})"
+                f"QPushButton {{background-color: rgb({r}, {g}, {b}); "
+                f"border: 1px solid black; color: {'white' if self.is_dark_color(self.chosen_color) else 'black'};}}"
             )
+            
             # Enable OK button and set selected label if we have text
             if self.new_label_edit.text():
                 self.ok_button.setEnabled(True)
                 self.selected_label = self.new_label_edit.text()
+                
+    def is_dark_color(self, color):
+        """Determine if a color is dark based on its luminance"""
+        r, g, b = color.red(), color.green(), color.blue()
+        luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+        return luminance < 0.5  # Return True for dark colors
+
+    def on_custom_color_selected(self, color, dialog):
+        """Handle click on a custom color button"""
+        dialog.setCurrentColor(color)
+        dialog.accept()
 
     def accept(self):
         """Handle OK button click"""

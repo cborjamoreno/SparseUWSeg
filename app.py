@@ -1,3 +1,4 @@
+import itertools
 import sys
 import os
 import cv2
@@ -10,10 +11,24 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QPixmap, QImage, QColor
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from sklearn.metrics.pairwise import cosine_similarity
+import torch
+import torch.nn.functional as F
+import math
 
 from segmenter_scop import Segmenter
+from label_predictor import LabelPredictor
 
 from label_dialog import LabelDialog
+
+def load_stylesheet(file_path):
+    """Load stylesheet from a file"""
+    try:
+        with open(file_path, 'r') as f:
+            return f.read()
+    except Exception as e:
+        print(f"Error loading stylesheet: {e}")
+        return ""
 
 # Subclass QLabel to capture mouse clicks on the image
 class ClickableLabel(QLabel):
@@ -31,7 +46,7 @@ class ClickableLabel(QLabel):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self.interactions_enabled:   
+        if (self.interactions_enabled):   
             self.mouse_moved.emit(event.pos())
         super().mouseMoveEvent(event)
 
@@ -81,42 +96,20 @@ class ImageViewer(QWidget):
         self.image_label.interactions_enabled = False
 
         # Buttons
+        stylesheet = load_stylesheet("button_styles.qss")
+        app.setStyleSheet(stylesheet)
+
         self.select_button = QPushButton("Select Folder", self)
         self.select_button.clicked.connect(self.select_folder)
         self.select_button.setFixedSize(150, 40)
-        self.select_button.setStyleSheet("""
-            QPushButton {
-                background-color: white;
-                color: black;
-                border: 1px solid #ccc;
-                border-radius: 4px;
-                padding: 5px;
-            }
-            QPushButton:hover {
-                background-color: #f0f0f0;
-            }
-        """)
+        self.select_button.setProperty("class", "select-folder-button")
         self.select_button.enterEvent = lambda e: self.on_cursor_over_button()
 
         self.start_button = QPushButton("Start", self)
         self.start_button.clicked.connect(self.start_labeling)
         self.start_button.setFixedSize(150, 40)
         self.start_button.setEnabled(False)
-        self.start_button.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 5px;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:disabled {
-                background-color: #BDBDBD;
-            }
-        """)
+        self.start_button.setProperty("class", "start-button")
         self.start_button.enterEvent = lambda e: self.on_cursor_over_button()
 
         # Navigation buttons
@@ -124,42 +117,14 @@ class ImageViewer(QWidget):
         self.prev_button.clicked.connect(self.prev_image)
         self.prev_button.setFixedSize(40, 40)
         self.prev_button.setEnabled(False)
-        self.prev_button.setStyleSheet("""
-            QPushButton {
-                background-color: #FF9800;
-                color: white;
-                border: none;
-                border-radius: 20px;
-                font-size: 20px;
-            }
-            QPushButton:hover {
-                background-color: #F57C00;
-            }
-            QPushButton:disabled {
-                background-color: #BDBDBD;
-            }
-        """)
+        self.prev_button.setProperty("class", "navigation-button")
         self.prev_button.enterEvent = lambda e: self.on_cursor_over_button()
 
         self.next_button = QPushButton(">", self)
         self.next_button.clicked.connect(self.next_image)
         self.next_button.setFixedSize(40, 40)
         self.next_button.setEnabled(False)
-        self.next_button.setStyleSheet("""
-            QPushButton {
-                background-color: #FF9800;
-                color: white;
-                border: none;
-                border-radius: 20px;
-                font-size: 20px;
-            }
-            QPushButton:hover {
-                background-color: #F57C00;
-            }
-            QPushButton:disabled {
-                background-color: #BDBDBD;
-            }
-        """)
+        self.next_button.setProperty("class", "navigation-button")
         self.next_button.enterEvent = lambda e: self.on_cursor_over_button()
 
         # New buttons for point selection
@@ -167,43 +132,23 @@ class ImageViewer(QWidget):
         self.switch_button.clicked.connect(self.switch_point_type)
         self.switch_button.setFixedSize(150, 40)
         self.switch_button.setEnabled(False)
-        self.switch_button.setStyleSheet("""
-            QPushButton {
-                background-color: #E60000;
-                color: white;
-                border: 1px solid black;
-                border-radius: 4px;
-                padding: 5px;
-            }
-            QPushButton:hover {
-                background-color: #CC0000;
-            }
-            QPushButton:disabled {
-                background-color: #BDBDBD;
-            }
-        """)
+        self.switch_button.setProperty("class", "switch-button-negative")
         self.switch_button.enterEvent = lambda e: self.on_cursor_over_button()
 
         self.finish_button = QPushButton("✓", self)
-        self.finish_button.clicked.connect(self.finish_points)
+        self.finish_button.clicked.connect(self.on_finish_button_clicked)
         self.finish_button.setFixedSize(40, 40)
         self.finish_button.setEnabled(False)
-        self.finish_button.setStyleSheet("""
-            QPushButton {
-                background-color: #006400;
-                color: white;
-                border: none;
-                border-radius: 20px;
-                font-size: 20px;
-            }
-            QPushButton:hover {
-                background-color: #004d00;
-            }
-            QPushButton:disabled {
-                background-color: #BDBDBD;
-            }
-        """)
+        self.finish_button.setProperty("class", "finish-button")
         self.finish_button.enterEvent = lambda e: self.on_cursor_over_button()
+
+        # Toggle mask visibility button
+        self.toggle_masks_button = QPushButton("👁️", self)
+        self.toggle_masks_button.clicked.connect(self.toggle_masks_visibility)
+        self.toggle_masks_button.setFixedSize(40, 40)
+        self.toggle_masks_button.setEnabled(False)
+        self.toggle_masks_button.setProperty("class", "toggle-masks-button")
+        self.toggle_masks_button.enterEvent = lambda e: self.on_cursor_over_button()
 
         # Create a horizontal layout for the bottom buttons
         bottom_button_layout = QHBoxLayout()
@@ -211,6 +156,7 @@ class ImageViewer(QWidget):
         bottom_button_layout.addWidget(self.start_button)
         bottom_button_layout.addWidget(self.switch_button)
         bottom_button_layout.addWidget(self.finish_button)
+        bottom_button_layout.addWidget(self.toggle_masks_button)
         bottom_button_layout.addStretch()
 
         # Create a container widget for the image and navigation buttons
@@ -263,9 +209,26 @@ class ImageViewer(QWidget):
         # Initially hide the point selection buttons
         self.switch_button.hide()
         self.finish_button.hide()
+        self.toggle_masks_button.hide()
+
+        # Initialize additional variables
+        self.current_image_path = None
+        self.current_label = None
+        self.expanded_areas_mask = None
+        self.current_mask = None
+        self.is_expanding = False
+        self.current_mask_area = 0
+        self.total_image_area = 0
+        self.coverage_ratio = 0
+        self.label_predictor = LabelPredictor(confidence_threshold=0.85, min_examples_per_class=5)
+
+        self.current_mode = "creation"  # or "selection"
+        self.is_over_mask = False
+        self.current_mask_index = None
+        self.masks_visible = True
 
     def select_folder(self):
-        folder = "/home/cesar/LabelExpansion/Datasets/MosaicsUCSD/train/images_prueba2"
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder with Images")
         if folder:
             self.image_list = [
                 os.path.join(folder, f)
@@ -290,11 +253,14 @@ class ImageViewer(QWidget):
         self.image_label.interactions_enabled = True
         self.switch_button.show()
         self.switch_button.setEnabled(False)  # Initially disabled
-        self.switch_button.setStyleSheet("background-color: #808080; color: white;")  # Gray background
         self.finish_button.show()
         self.finish_button.setEnabled(False)  # Will be enabled after first positive point
         self.start_button.setEnabled(False)  # Disable Start button until Next Image is pressed
         self.is_selecting_points = True
+
+        # Show the toggle masks button but disable it until first mask is created
+        self.toggle_masks_button.show()
+        self.toggle_masks_button.setEnabled(False)
 
         # Create a modal progress dialog
         wait_dialog = QDialog(self)
@@ -333,7 +299,7 @@ class ImageViewer(QWidget):
 
     def on_masking_complete(self, best_point, wait_dialog):
         wait_dialog.accept()
-        if best_point:
+        if (best_point):
             print(f"Proposed point: {best_point}")
             self.suggested_point = best_point
         else:
@@ -349,36 +315,58 @@ class ImageViewer(QWidget):
         current_point = self.get_image_coordinates(pos)
         if current_point is None:
             return
-
-        # Add point to appropriate list
-        if self.current_point_type == "positive":
-            self.positive_points.append(current_point)
-            print(f"Positive point added at: {current_point}")
-            # Enable finish button and switch button after first positive point
-            self.finish_button.setEnabled(True)
-            self.switch_button.setEnabled(True)
-            self.switch_button.setStyleSheet("""
-                QPushButton {
-                    background-color: #E60000;
-                    color: white;
-                    border: 1px solid black;
-                    border-radius: 4px;
-                    padding: 5px;
-                }
-                QPushButton:hover {
-                    background-color: #CC0000;
-                }
-                QPushButton:disabled {
-                    background-color: #BDBDBD;
-                }
-            """)
+        
+        # Check which mode we're in
+        if hasattr(self, 'current_mode'):
+            # Don't do anything on clicks in visualization mode
+            if self.current_mode == "visualization":
+                return
+            elif self.current_mode == "selection":
+                mask_index = self.get_mask_at_position(current_point)
+                if mask_index is not None:
+                    # Show context menu for the selected mask
+                    self.current_mask_index = mask_index
+                    self.show_mask_context_menu(pos, mask_index)
+                    return
+            elif self.current_mode == "creation":
+                # We're in creation mode - first check if we're over a mask
+                mask_index = self.get_mask_at_position(current_point)
+                if mask_index is not None and self.is_over_mask:
+                    # Show context menu for the selected mask
+                    self.current_mask_index = mask_index
+                    self.show_mask_context_menu(pos, mask_index)
+                else:
+                    # Normal point placement behavior
+                    if self.current_point_type == "positive":
+                        self.positive_points.append(current_point)
+                        print(f"Positive point added at: {current_point}")
+                        self.finish_button.setEnabled(True)
+                        self.switch_button.setEnabled(True)
+                    else:
+                        self.negative_points.append(current_point)
+                        print(f"Negative point added at: {current_point}")
+                    
+                    # Update preview with the new point
+                    self.update_preview_with_points()
         else:
-            self.negative_points.append(current_point)
-            print(f"Negative point added at: {current_point}")
+            # Fallback if mode is not set
+            if self.current_point_type == "positive":
+                self.positive_points.append(current_point)
+                print(f"Positive point added at: {current_point}")
+                self.finish_button.setEnabled(True)
+                self.switch_button.setEnabled(True)
+            else:
+                self.negative_points.append(current_point)
+                print(f"Negative point added at: {current_point}")
+            
+            # Update preview with the new point
+            self.update_preview_with_points()
 
-        # Start with original image and add cached overlay if it exists
+    def update_preview_with_points(self):
+        """Update display with current points and preview mask"""
+        # Start with original image and add cached overlay if masks are visible
         overlay_image = self.current_image.copy()
-        if self.combined_mask_overlay is not None:
+        if self.masks_visible and self.combined_mask_overlay is not None:
             overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.6, 0)
 
         # Draw all current points
@@ -395,7 +383,7 @@ class ImageViewer(QWidget):
             
             if preview_mask is not None:
                 colored_preview = np.zeros_like(overlay_image)
-                colored_preview[preview_mask > 0] = (128, 128, 128)  # Gray instead of green
+                colored_preview[preview_mask > 0] = (128, 128, 128)  # Gray for preview
                 overlay_image = cv2.addWeighted(overlay_image, 1.0, colored_preview, 0.4, 0)
 
         # Add suggested point if it exists
@@ -406,10 +394,207 @@ class ImageViewer(QWidget):
 
         self.update_display(overlay_image)
 
+    def delete_mask(self, mask_index):
+        """Delete a mask and update the display"""
+        if not (0 <= mask_index < len(self.expanded_masks)):
+            return
+            
+        mask, label, _ = self.expanded_masks[mask_index]
+        
+        # Remove from expanded masks
+        self.expanded_masks.pop(mask_index)
+        
+        # Regenerate the combined mask overlay
+        self.regenerate_combined_mask_overlay()
+        
+        # Reset selection state
+        self.current_mask_index = None
+        self.current_mode = "creation"
+        self.is_over_mask = False
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        
+        # Print informative message
+        print(f"Deleted mask with label '{label}'")
+        
+        # Update the display
+        self.update_display_with_current_state()
+
+    def change_mask_label(self, mask_index):
+        """Change the label of a mask"""
+        if not (0 <= mask_index < len(self.expanded_masks)):
+            return
+            
+        mask, old_label, _ = self.expanded_masks[mask_index]
+        
+        # Show label dialog to pick a new label
+        dialog = LabelDialog(self.labels, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_label = dialog.selected_label
+            if new_label is None:
+                new_label = dialog.new_label_edit.text()
+                if new_label and dialog.chosen_color:
+                    self.labels[new_label] = dialog.chosen_color
+            
+            if new_label and new_label in self.labels:
+                color = self.labels[new_label]
+                
+                # Update the mask in the list
+                self.expanded_masks[mask_index] = (mask, new_label, color)
+                
+                # Update the combined overlay
+                self.regenerate_combined_mask_overlay()
+                
+                print(f"Changed mask label from '{old_label}' to '{new_label}'")
+                
+                # Update the display
+                self.update_display_with_current_state()
+
+    def regenerate_combined_mask_overlay(self):
+        """Regenerate the combined mask overlay from all masks"""
+        if not self.expanded_masks:
+            self.combined_mask_overlay = None
+            return
+    
+        self.combined_mask_overlay = np.zeros_like(self.current_image)
+        
+        for mask, _, color in self.expanded_masks:
+            colored_mask = np.zeros_like(self.current_image)
+            colored_mask[mask > 0] = [color.red(), color.green(), color.blue()]
+            self.combined_mask_overlay[mask > 0] = colored_mask[mask > 0]
+
+    def show_mask_context_menu(self, pos, mask_index):
+        """Show context menu for the selected mask"""
+        from PyQt6.QtWidgets import QMenu
+        from PyQt6.QtGui import QAction  # Import QAction from QtGui instead of QtWidgets
+        
+        if mask_index is None or mask_index >= len(self.expanded_masks):
+            return
+        
+        mask, label, color = self.expanded_masks[mask_index]
+        
+        # Create context menu
+        context_menu = QMenu(self)
+        
+        # Add actions
+        delete_action = QAction(f"Delete '{label}' mask", self)
+        change_label_action = QAction(f"Change label (current: '{label}')", self)
+        
+        # Add actions to menu
+        context_menu.addAction(delete_action)
+        context_menu.addAction(change_label_action)
+        
+        # Connect actions to handlers
+        delete_action.triggered.connect(lambda: self.delete_mask(mask_index))
+        change_label_action.triggered.connect(lambda: self.change_mask_label(mask_index))
+        
+        # Show context menu at cursor position
+        context_menu.exec(self.mapToGlobal(pos))
+
     def on_mask_expansion_complete(self, mask, stored_positive_points):
         if mask is None:
             print("No mask generated.")
+            self.is_expanding = False  # Reset expansion state
+            self.finish_button.setEnabled(True)  # Re-enable the finish button
             return
+
+        # Print detailed database status at the beginning
+        self.label_predictor.print_database_status()
+            
+        # Get predictions for current mask BEFORE showing dialog (to show initial predictions)
+        if hasattr(self, 'label_predictor'):
+            print("\n===== INITIAL MASK PREDICTION =====")
+            
+            if not self.labels:
+                print("No labels defined yet. This will be the first mask.")
+            elif not hasattr(self.label_predictor, 'feature_database') or len(self.label_predictor.feature_database) == 0:
+                print("Feature database is empty. No predictions possible.")
+            else:
+                # Get predictions for current mask (even if we don't have enough examples)
+                try:
+                    # Try to get raw similarities for all classes
+                    features = self.label_predictor._extract_features(self.current_image, mask)
+                    
+                    print(f"Available labels: {list(self.labels.keys())}")
+                    print(f"Current min examples threshold: {self.label_predictor.min_examples_per_class}")
+                    
+                    # Get predictions with all available classes
+                    all_predictions = []
+                    
+                    # Try to compute similarities even if below min_examples threshold
+                    if hasattr(self.label_predictor, 'prototypes') and self.label_predictor.prototypes:
+                        for label, prototype in self.label_predictor.prototypes.items():
+                            current_count = len(self.label_predictor.feature_database.get(label, []))
+                            try:
+                                # Extract spatial features from the image
+                                spatial_features = self.label_predictor._extract_features(self.current_image, mask)
+                                
+                                # Calculate mask embedding (average of features inside the mask)
+                                mask_embedding = self.label_predictor._compute_mask_embedding(spatial_features, mask)
+                                
+                                if mask_embedding is None:
+                                    print(f"Could not calculate embedding for '{label}': Empty mask")
+                                    continue
+                                    
+                                # Convert to torch tensors with correct dimensions
+                                feat_tensor = torch.tensor(mask_embedding, dtype=torch.float32)
+                                proto_tensor = torch.tensor(prototype, dtype=torch.float32)
+
+                                # Check for problematic values before normalization
+                                if torch.isnan(feat_tensor).any() or torch.isinf(feat_tensor).any():
+                                    print(f"Warning: NaN or Inf in feature tensor before normalization")
+                                    # Replace problematic values with zeros
+                                    feat_tensor = torch.nan_to_num(feat_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
+
+                                if torch.isnan(proto_tensor).any() or torch.isinf(proto_tensor).any():
+                                    print(f"Warning: NaN or Inf in prototype tensor before normalization")
+                                    # Replace problematic values with zeros
+                                    proto_tensor = torch.nan_to_num(proto_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
+
+                                # Then normalize with epsilon for numerical stability
+                                feat_norm = F.normalize(feat_tensor, dim=0, eps=1e-8)
+                                proto_norm = F.normalize(proto_tensor, dim=0, eps=1e-8)
+
+                                # Safe dot product with error handling
+                                try:
+                                    similarity = torch.dot(feat_norm, proto_norm).item()
+                                    if math.isnan(similarity) or math.isinf(similarity):
+                                        print(f"Warning: Similarity calculation produced NaN or Inf, defaulting to 0.0")
+                                        similarity = 0.0
+                                except Exception as e:
+                                    print(f"Error in similarity calculation: {e}")
+                                    similarity = 0.0
+
+                                all_predictions.append((label, similarity, current_count))
+                            except Exception as e:
+                                print(f"Could not calculate similarity for '{label}': {e}")
+                                
+                        # Sort by similarity
+                        all_predictions.sort(key=lambda x: x[1], reverse=True)
+                        
+                        if all_predictions:
+                            print("Raw similarity scores (before applying threshold):")
+                            for label, similarity, current_count in all_predictions:
+                                sufficient = "✓" if current_count >= self.label_predictor.min_examples_per_class else "✗"
+                                print(f"  - '{label}': {similarity:.4f} ({similarity*100:.1f}%) [Examples: {current_count} {sufficient}]")
+                    
+                    # Now get the official predictions that pass the threshold
+                    predictions = self.label_predictor.predict_label(self.current_image, mask)
+                    if predictions:
+                        print("\nOfficial predictions (after applying threshold):")
+                        for label, prob in predictions:
+                            print(f"  - '{label}': {prob:.4f} ({prob*100:.1f}%)")
+                        
+                        # Check if auto-assignment would happen
+                        should_auto, auto_label = self.label_predictor.should_auto_assign(self.current_image, mask)
+                        print(f"\nWould auto-assign: {should_auto}, Label: '{auto_label}'")
+                        print(f"Confidence threshold: {self.label_predictor.confidence_threshold}")
+                    else:
+                        print("No official predictions available - insufficient examples per class")
+                    
+                except Exception as e:
+                    print(f"Error getting predictions: {e}")
+                
+            print("==================================\n")
 
         dialog = LabelDialog(self.labels, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -420,14 +605,25 @@ class ImageViewer(QWidget):
                     self.labels[label] = dialog.chosen_color
             color = self.labels.get(label)
             if color:
+                # Update current_mask and current_label for future reference
+                self.current_mask = mask
+                self.current_label = label
+                
                 # Keep storing in expanded_masks for future reference
                 self.expanded_masks.append((mask, label, color))
+
+                # Enable the toggle masks button after first mask is created
+                if not self.toggle_masks_button.isEnabled():
+                    self.toggle_masks_button.setEnabled(True)
+                
+                # Create overlay image BEFORE using it
+                overlay_image = self.current_image.copy()
                 
                 # Update the combined overlay for efficient display
                 if self.combined_mask_overlay is None:
                     self.combined_mask_overlay = np.zeros_like(self.current_image)
                 
-                colored_mask = np.zeros_like(self.current_image)
+                colored_mask = np.zeros_like(overlay_image)
                 colored_mask[mask > 0] = [color.red(), color.green(), color.blue()]
                 self.combined_mask_overlay[mask > 0] = colored_mask[mask > 0]
                 
@@ -450,23 +646,252 @@ class ImageViewer(QWidget):
                     self.suggested_point = self.segmenter.get_best_point()
                 
                 self.update_display(overlay_image)
+                
+                # Calculate and display coverage statistics
+                self.current_mask_area = np.sum(mask)
+                self.total_image_area = self.current_image.shape[0] * self.current_image.shape[1]
+                self.coverage_ratio = self.current_mask_area / self.total_image_area
+                
+                # DEBUG: Print feature extraction progress
+                print(f"\nAdding example for label '{label}'...")
+                try:
+                    # Train predictor with the new example
+                    self.label_predictor.add_example(self.current_image, mask, label)
+                    print(f"✓ Successfully added example for label: {label}")
+                    
+                    # Show detailed database status after adding
+                    self.label_predictor.print_database_status(detailed=True)
+                    
+                    # Train embeddings using contrastive learning if we have enough examples
+                    class_counts = {label: len(examples) for label, examples in 
+                                   self.label_predictor.feature_database.items()}
+                    
+                    # Check if we have enough data to perform contrastive training
+                    # We need at least 2 classes with examples
+                    classes_with_examples = sum(1 for count in class_counts.values() if count > 0)
+                    
+                    if classes_with_examples >= 2:
+                        print("\n===== TRAINING EMBEDDINGS WITH CONTRASTIVE LEARNING =====")
+                        print(f"Classes with examples: {classes_with_examples}")
+                        
+                        # List all classes and their example counts
+                        print("Label Distribution:")
+                        for label, count in class_counts.items():
+                            print(f"  - '{label}': {count} examples")
+                        
+                        # Use more epochs for significant updates
+                        self.label_predictor.train_contrastive_optimized(epochs=20, margin=0.5)
+                        
+                        # Show similarities between classes after training
+                        print("\n===== POST-TRAINING SIMILARITY ANALYSIS =====")
+                        for label1, label2 in itertools.combinations(self.label_predictor.prototypes.keys(), 2):
+                            if label1 in self.label_predictor.prototypes and label2 in self.label_predictor.prototypes:
+                                proto1 = self.label_predictor.prototypes[label1]
+                                proto2 = self.label_predictor.prototypes[label2]
+                                
+                                # Calculate similarity between prototypes
+                                similarity = cosine_similarity(
+                                    np.array(proto1).reshape(1, -1),
+                                    np.array(proto2).reshape(1, -1)
+                                )[0][0]
+                                
+                                print(f"Similarity between '{label1}' and '{label2}': {similarity:.4f}")
+                        
+                        print("===== CONTRASTIVE TRAINING COMPLETE =====\n")
+                    else:
+                        print("\nNot enough classes for contrastive learning yet.")
+                        print(f"Need at least 2 classes with examples (current: {classes_with_examples})")
+                    
+                    # Show updated predictions
+                    print("\n===== UPDATED PREDICTIONS =====")
+                    predictions = self.label_predictor.predict_label(self.current_image, mask)
+                    
+                    if predictions:
+                        for label, prob in predictions:
+                            print(f"  - '{label}': {prob:.4f} ({prob*100:.1f}%)")
+                    else:
+                        print("No predictions available - need more examples")
+                    print("===============================\n")
+                    
+                except Exception as e:
+                    print(f"✗ Failed to add example or train contrastive model: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                
+                # ...rest of existing code...
+        # Reset expansion state regardless of dialog result
+        self.is_expanding = False
+        
+        # Re-enable the finish button for the next mask
+        self.finish_button.setEnabled(True)
+        
+        # Instead of automatically starting a new labeling cycle, just prepare for the next one
+        # This way the user can place points for the next mask at their own pace
+        self.switch_button.setEnabled(False)
+        if self.current_point_type == "negative":
+            self.switch_point_type()  # Reset to positive if it was negative
 
-        # Start the next labeling cycle
-        QTimer.singleShot(100, self.start_labeling)
+    def toggle_masks_visibility(self):
+        """Toggle the visibility of all masks"""
+        self.masks_visible = not self.masks_visible
+        
+        # Update button appearance and mode
+        if self.masks_visible:
+            self.toggle_masks_button.setText("👁️❌")
+            # Return to creation mode when showing masks
+            self.current_mode = "creation" 
+        else:
+            # When hiding masks, switch to visualization mode
+            self.toggle_masks_button.setText("👁️")
+            self.current_mode = "visualization"
+            self.is_over_mask = False
+            self.current_mask_index = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        
+        # Update the display
+        if self.current_image is not None:
+            self.update_display_with_current_state()
+
+    def get_mask_at_position(self, pos):
+        """Determine which mask (if any) is at the given position"""
+        if not self.expanded_masks or not self.masks_visible:
+            return None
+        
+        x, y = pos
+        
+        # Check each mask in reverse order (newest first)
+        for i in range(len(self.expanded_masks) - 1, -1, -1):
+            mask, _, _ = self.expanded_masks[i]
+            
+            # Check if the position is within this mask
+            if 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1] and mask[y, x]:
+                return i
+        
+        return None
+
+    def update_display_with_current_state(self):
+        """Update the display with current masks and points"""
+        # Start with the original image
+        overlay_image = self.current_image.copy()
+        
+        # Add all expanded masks if visible
+        if self.masks_visible and self.expanded_masks:
+            # Generate a fresh overlay
+            combined_overlay = np.zeros_like(self.current_image)
+            for i, (mask, _, color) in enumerate(self.expanded_masks):
+                # Highlight selected mask with brighter color
+                alpha = 0.8 if i == self.current_mask_index else 0.6
+                colored_mask = np.zeros_like(overlay_image)
+                colored_mask[mask > 0] = [color.red(), color.green(), color.blue()]
+                combined_overlay[mask > 0] = colored_mask[mask > 0]
+            
+            overlay_image = cv2.addWeighted(overlay_image, 1.0, combined_overlay, 0.6, 0)
+        
+        # Draw points in creation mode
+        if self.current_mode == "creation":
+            # Draw all current points
+            for point in self.positive_points:
+                cv2.circle(overlay_image, point, 4, (0, 255, 0), -1)  # Green for positive
+            for point in self.negative_points:
+                cv2.circle(overlay_image, point, 4, (255, 0, 0), -1)  # Red for negative
+            
+            # Add suggested point if it exists
+            if hasattr(self, 'suggested_point') and self.suggested_point:
+                row, col = self.suggested_point
+                cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
+                cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+        
+        # Update the display
+        self.update_display(overlay_image)
 
     def on_mouse_moved(self, pos):
-        # Process movement immediately without timer
-        if hasattr(self, 'waiting_for_negative') and self.waiting_for_negative:
-            # If waiting for negative point, do two-point dynamic expansion
-            self.dynamic_expand_with_negative(pos)
-        else:
-            # If not waiting for negative point, do normal single-point dynamic expansion
+        """Handle mouse movement - determine mode and update preview"""
+        # Skip if not in interactive mode
+        if not self.is_selecting_points or self.current_image is None:
+            return
+        
+        # Get image coordinates from screen coordinates
+        image_pos = self.get_image_coordinates(pos)
+        
+        # Special handling for cursor outside the image area
+        if image_pos is None:
+            # If we have points, show expansion with just the existing points
+            if self.positive_points or self.negative_points:
+                # Start with original image and add cached overlay if visible
+                overlay_image = self.current_image.copy()
+                if self.masks_visible and self.combined_mask_overlay is not None:
+                    overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.6, 0)
+                
+                # Create points array with only existing points
+                points = np.array(self.positive_points + self.negative_points)
+                labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points))
+                
+                # Generate preview mask using only existing points
+                preview_mask = self.segmenter.propagate_points(points, labels, update_expanded_mask=False)
+                
+                # Add the preview mask
+                if preview_mask is not None:
+                    colored_preview = np.zeros_like(overlay_image)
+                    colored_preview[preview_mask > 0] = (128, 128, 128)  # Gray for preview
+                    overlay_image = cv2.addWeighted(overlay_image, 1.0, colored_preview, 0.4, 0)
+                
+                # Draw all current points
+                for point in self.positive_points:
+                    cv2.circle(overlay_image, point, 4, (0, 255, 0), -1)
+                for point in self.negative_points:
+                    cv2.circle(overlay_image, point, 4, (255, 0, 0), -1)
+                
+                # Add suggested point if it exists
+                if hasattr(self, 'suggested_point') and self.suggested_point and self.current_mode == "creation":
+                    row, col = self.suggested_point
+                    cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
+                    cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+                    
+                # Update the display
+                self.update_display(overlay_image)
+            return
+        
+        # If we reach here, the cursor is inside the image
+        # Check which mode we're in
+        if self.current_mode == "creation":
+            # Call the dynamic expansion function with the current position
             self.dynamic_expand(pos)
+        elif self.current_mode == "selection":
+            # Handle hover over masks
+            mask_index = self.get_mask_at_position(image_pos)
+            if mask_index is not None:
+                if not self.is_over_mask or self.current_mask_index != mask_index:
+                    self.is_over_mask = True
+                    self.current_mask_index = mask_index
+                    self.setCursor(Qt.CursorShape.PointingHandCursor)
+                    # Update display to highlight the mask
+                    self.update_display_with_current_state()
+            else:
+                if self.is_over_mask:
+                    self.is_over_mask = False
+                    self.current_mask_index = None
+                    self.setCursor(Qt.CursorShape.ArrowCursor)
+                    # Update display to remove highlight
+                    self.update_display_with_current_state()
 
     def on_cursor_over_button(self):
         """Called when cursor enters any button"""
         if self.is_selecting_points:
-            # If we have points placed, show dynamic expansion with those points
+            # If in visualization mode (masks hidden), don't show any masks
+            if self.current_mode == "visualization" or not self.masks_visible:
+                # Just show the base image without any masks
+                overlay_image = self.current_image.copy()
+                
+                # Add suggested point if needed in this mode
+                if hasattr(self, 'suggested_point') and self.suggested_point and self.current_mode == "creation":
+                    row, col = self.suggested_point
+                    cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
+                    cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+                    
+                self.update_display(overlay_image)
+                return
+            
+            # For regular mode with visible masks - continue with existing behavior
             if self.positive_points or self.negative_points:
                 points = np.array(self.positive_points + self.negative_points)
                 labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points))
@@ -499,7 +924,7 @@ class ImageViewer(QWidget):
             else:
                 # If no points are placed, just show the base image with any existing overlay
                 overlay_image = self.current_image.copy()
-                if self.combined_mask_overlay is not None:
+                if self.combined_mask_overlay is not None and self.masks_visible:
                     overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.6, 0)
                 
                 # Add suggested point if it exists
@@ -511,18 +936,39 @@ class ImageViewer(QWidget):
                 self.update_display(overlay_image)
 
     def dynamic_expand(self, pos):
+        """Handle dynamic expansion with cursor position"""
+        # Skip if not in creation mode or not selecting points
         if not self.is_selecting_points or self.current_image is None or self.displayed_pixmap is None:
             return
 
-        # Check if cursor is within the image display area
-        label_width = self.image_label.width()
-        label_height = self.image_label.height()
-        pixmap_width = self.displayed_pixmap.width()
-        pixmap_height = self.displayed_pixmap.height()
-
-        offset_x = (label_width - pixmap_width) / 2
-        offset_y = (label_height - pixmap_height) / 2
-
+        # Get image coordinates for the cursor position
+        cursor_point = self.get_image_coordinates(pos)
+        if cursor_point is None:
+            return
+            
+        # First check if we're over an existing mask
+        mask_index = self.get_mask_at_position(cursor_point)
+        
+        # If over a mask, switch to selection behavior
+        if mask_index is not None and self.masks_visible:
+            # If we just entered a mask, switch to pointing hand cursor
+            if not self.is_over_mask or self.current_mask_index != mask_index:
+                self.is_over_mask = True
+                self.current_mask_index = mask_index
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+                # Update display to highlight the mask
+                self.update_display_with_current_state()
+            # Skip dynamic expansion while over a mask
+            return
+        else:
+            # If we just left a mask, reset cursor and selection state
+            if self.is_over_mask:
+                self.is_over_mask = False
+                self.current_mask_index = None
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                # Update display to remove highlight
+                self.update_display_with_current_state()
+        
         # Start with original image and add cached overlay if it exists
         overlay_image = self.current_image.copy()
         if self.combined_mask_overlay is not None:
@@ -534,35 +980,21 @@ class ImageViewer(QWidget):
         for point in self.negative_points:
             cv2.circle(overlay_image, point, 4, (255, 0, 0), -1)  # Red for negative
 
-        # Do dynamic expansion with cursor point if it's within the image display
-        if offset_x <= pos.x() <= offset_x + pixmap_width and offset_y <= pos.y() <= offset_y + pixmap_height:
-            cursor_point = self.get_image_coordinates(pos)
-            if cursor_point is not None:
-                # Create points array with all current points plus cursor
-                points = np.array(self.positive_points + self.negative_points + [cursor_point])
-                cursor_label = 0 if self.current_point_type == "negative" else 1
-                labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points) + [cursor_label])
-                preview_mask = self.segmenter.propagate_points(points, labels, update_expanded_mask=False)
+        # Create points array with all current points plus cursor
+        points = np.array(self.positive_points + self.negative_points + [cursor_point])
+        cursor_label = 0 if self.current_point_type == "negative" else 1
+        labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points) + [cursor_label])
+        preview_mask = self.segmenter.propagate_points(points, labels, update_expanded_mask=False)
 
-                # Add the preview mask if it exists
-                if preview_mask is not None:
-                    colored_preview = np.zeros_like(overlay_image)
-                    colored_preview[preview_mask > 0] = (128, 128, 128)  # Gray instead of green
-                    overlay_image = cv2.addWeighted(overlay_image, 1.0, colored_preview, 0.4, 0)
+        # Add the preview mask if it exists
+        if preview_mask is not None:
+            colored_preview = np.zeros_like(overlay_image)
+            colored_preview[preview_mask > 0] = (128, 128, 128)  # Gray instead of green
+            overlay_image = cv2.addWeighted(overlay_image, 1.0, colored_preview, 0.4, 0)
 
-                # Draw cursor point
-                cursor_color = (0, 255, 0) if self.current_point_type == "positive" else (255, 0, 0)
-                cv2.circle(overlay_image, cursor_point, 4, cursor_color, -1)
-        else:
-            # If cursor is outside, only show expansion with placed points if any exist
-            if self.positive_points or self.negative_points:
-                points = np.array(self.positive_points + self.negative_points)
-                labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points))
-                preview_mask = self.segmenter.propagate_points(points, labels, update_expanded_mask=False)
-                if preview_mask is not None:
-                    colored_preview = np.zeros_like(overlay_image)
-                    colored_preview[preview_mask > 0] = (128, 128, 128)  # Gray instead of green
-                    overlay_image = cv2.addWeighted(overlay_image, 1.0, colored_preview, 0.4, 0)
+        # Draw cursor point
+        cursor_color = (0, 255, 0) if self.current_point_type == "positive" else (255, 0, 0)
+        cv2.circle(overlay_image, cursor_point, 4, cursor_color, -1)
 
         # Add suggested point if it exists
         if hasattr(self, 'suggested_point') and self.suggested_point:
@@ -726,6 +1158,8 @@ class ImageViewer(QWidget):
         # Hide the point selection buttons and enable Start button
         self.switch_button.hide()
         self.finish_button.hide()
+        self.toggle_masks_button.hide()
+        self.toggle_masks_button.setEnabled(False)
         self.start_button.setEnabled(True)
         
         # Move to next image
@@ -774,6 +1208,7 @@ class ImageViewer(QWidget):
         self.current_index = 0
         self.start_button.setEnabled(False)
         self.next_button.setEnabled(False)
+        self.prev_button.setEnabled(False)
 
     def closeEvent(self, event):
         if self.image_list and 0 <= self.current_index < len(self.image_list):
@@ -798,69 +1233,101 @@ class ImageViewer(QWidget):
         """Switch between positive and negative point selection"""
         if self.current_point_type == "positive":
             self.current_point_type = "negative"
-            self.switch_button.setText("Positive")
-            self.switch_button.setStyleSheet("""
-                QPushButton {
-                    background-color: #00FF00;
-                    color: black;
-                    border: 1px solid black;
-                    border-radius: 4px;
-                    padding: 5px;
-                }
-                QPushButton:hover {
-                    background-color: #00E600;
-                }
-                QPushButton:disabled {
-                    background-color: #BDBDBD;
-                }
-            """)
+            self.switch_button.setText("Positive") 
+            self.switch_button.setProperty("class", "switch-button-positive")
         else:
             self.current_point_type = "positive"
             self.switch_button.setText("Negative")
-            self.switch_button.setStyleSheet("""
-                QPushButton {
-                    background-color: #E60000;
-                    color: white;
-                    border: 1px solid black;
-                    border-radius: 4px;
-                    padding: 5px;
-                }
-                QPushButton:hover {
-                    background-color: #CC0000;
-                }
-                QPushButton:disabled {
-                    background-color: #BDBDBD;
-                }
-            """)
-
-    def finish_points(self):
-        """Finish adding points and proceed with mask expansion"""
-        if not self.positive_points:
-            return
-
-        # Store points before clearing them
-        stored_positive_points = self.positive_points.copy()
-        stored_negative_points = self.negative_points.copy()
-
-        # Convert points to numpy arrays
-        points = np.array(stored_positive_points + stored_negative_points)
-        labels = np.array([1] * len(stored_positive_points) + [0] * len(stored_negative_points))
+            self.switch_button.setProperty("class", "switch-button-negative")
         
-        # Reset points for next mask
-        self.positive_points = []
-        self.negative_points = []
-        self.current_point_type = "positive"
-        self.switch_button.setText("Negative")
-        self.switch_button.setStyleSheet("background-color: #808080; color: white;")  # Gray background
-        self.switch_button.setEnabled(False)
-        self.finish_button.setEnabled(False)
-        self.is_selecting_points = False
+        # Force style refresh
+        self.switch_button.style().unpolish(self.switch_button)
+        self.switch_button.style().polish(self.switch_button)
 
-        # Process the points
-        self.suggested_point = None
-        self.expansion_thread = MaskExpansionThread(self.segmenter, points, labels)
-        self.expansion_thread.result_ready.connect(lambda mask: self.on_mask_expansion_complete(mask, stored_positive_points))
-        self.expansion_thread.start()
+    def on_finish_button_clicked(self):
+        """Handle finish button click - expand mask and update UI"""
+        if not self.is_expanding and self.positive_points:
+            # Stop any ongoing expansion
+            if hasattr(self, 'expansion_thread') and self.expansion_thread and self.expansion_thread.isRunning():
+                self.expansion_thread.terminate()
+                self.expansion_thread.wait()
+            
+            # Combine positive and negative points
+            points = np.array(self.positive_points + self.negative_points)
+            # Create appropriate labels (1 for positive points, 0 for negative points)
+            labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points))
+            
+            # Store positive points for reference
+            stored_positive_points = self.positive_points.copy()
+            
+            # Create expansion thread with correct points and labels format
+            self.expansion_thread = MaskExpansionThread(
+                self.segmenter,
+                points,
+                labels
+            )
+            
+            # Connect to result_ready signal instead of finished signal
+            self.expansion_thread.result_ready.connect(
+                lambda mask: self.on_mask_expansion_complete(mask, stored_positive_points)
+            )
+            
+            # Start expansion
+            self.is_expanding = True
+            self.expansion_thread.start()
+            
+            # Update UI
+            self.finish_button.setEnabled(False)
+            
+            # REMOVED: Don't add examples here as they're added in on_mask_expansion_complete
+            # This was causing duplicate examples in the database
+            
+            # Clear points for next mask
+            self.positive_points = []
+            self.negative_points = []
+
+    def on_expansion_finished(self, mask):
+        """Handle mask expansion completion"""
+        if mask is not None:
+            # Update current mask
+            self.current_mask = mask
+            
+            # Update expanded areas mask
+            if not hasattr(self, 'expanded_areas_mask') or self.expanded_areas_mask is None:
+                self.expanded_areas_mask = mask.copy()
+            else:
+                self.expanded_areas_mask = np.logical_or(self.expanded_areas_mask, mask)
+            
+            # Calculate coverage stats
+            self.current_mask_area = np.sum(mask)
+            self.total_image_area = self.current_image.shape[0] * self.current_image.shape[1]
+            self.coverage_ratio = self.current_mask_area / self.total_image_area
+            
+            # Output coverage info to console
+            print(f"Current Mask Coverage: {self.coverage_ratio:.2%}")
+            
+            # Check for auto-assignment of label
+            should_auto = False
+            predicted_label = None
+            if hasattr(self, 'label_predictor'):
+                should_auto, predicted_label = self.label_predictor.should_auto_assign(self.current_image, mask)
+            
+            if should_auto:
+                # Auto-assign the label
+                self.current_label = predicted_label
+                print(f"Auto-assigned label: {predicted_label}")
+            else:
+                # Get predictions for suggestions
+                predictions = self.label_predictor.predict_label(self.current_image, mask)
+                if predictions:
+                    print("Label suggestions:")
+                    for label, prob in predictions:
+                        print(f"- {label}: {prob:.2%}")
+            
+            # Update the display
+            self.update_display_with_current_state()
+            self.finish_button.setEnabled(True)
+            self.is_expanding = False
 
     def prev_image(self):
         """Move to the previous image"""
@@ -893,6 +1360,7 @@ class ImageViewer(QWidget):
         # Hide the point selection buttons and enable Start button
         self.switch_button.hide()
         self.finish_button.hide()
+        self.toggle_masks_button.hide()
         self.start_button.setEnabled(True)
         
         # Move to previous image
@@ -904,6 +1372,57 @@ class ImageViewer(QWidget):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         self.current_image = image
         self.show_image()
+
+    def on_label_changed(self, label):
+        """Handle label selection change"""
+        self.current_label = label
+        if self.current_mask is not None:
+            # Get predictions for the current mask
+            predictions = self.label_predictor.predict_label(self.image, self.current_mask)
+            if predictions:
+                print(f"Predictions for current mask with label '{label}':")
+                for pred_label, prob in predictions:
+                    print(f"- {pred_label}: {prob:.2%}")
+            
+            # Update UI
+            self.update_image_display()
+
+    # Add this method to the ImageViewer class
+    def keyPressEvent(self, event):
+        """Handle key press events"""
+        from PyQt6.QtGui import QKeySequence
+        from PyQt6.QtCore import Qt
+        
+        # Check for Ctrl+Z
+        if event.key() == Qt.Key.Key_Z and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.current_mode == "creation" and self.is_selecting_points:
+                # Remove the last placed point
+                if self.negative_points and self.current_point_type == "negative":
+                    removed_point = self.negative_points.pop()
+                    print(f"Removed negative point at: {removed_point}")
+                elif self.positive_points and self.current_point_type == "positive":
+                    removed_point = self.positive_points.pop()
+                    print(f"Removed positive point at: {removed_point}")
+                    # If no positive points left, disable finish button
+                    if not self.positive_points:
+                        self.finish_button.setEnabled(False)
+                else:
+                    # Try the opposite type as well (more intuitive)
+                    if self.negative_points:
+                        removed_point = self.negative_points.pop()
+                        print(f"Removed negative point at: {removed_point}")
+                    elif self.positive_points:
+                        removed_point = self.positive_points.pop()
+                        print(f"Removed positive point at: {removed_point}")
+                        # If no positive points left, disable finish button
+                        if not self.positive_points:
+                            self.finish_button.setEnabled(False)
+                
+                # Update the display
+                self.update_preview_with_points()
+        
+        # Call the parent class handler
+        super().keyPressEvent(event)
 
 # Run the application
 app = QApplication(sys.argv)

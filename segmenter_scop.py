@@ -322,32 +322,32 @@ class Segmenter:
                         if coverage_ratio >= COVERAGE_THRESHOLD:
                             # Add to rejected masks and continue to next mask
                             self.rejected_masks.add(id(mask))
-                            print(f"Skipping mask at centroid ({int(centroid[0])}, {int(centroid[1])})")
-                            print(f"Coverage ratio: {coverage_ratio:.2%}")
-                            print(f"New pixels: {new_pixels}, Covered pixels: {covered_pixels}")
+                            # print(f"Skipping mask at centroid ({int(centroid[0])}, {int(centroid[1])})")
+                            # print(f"Coverage ratio: {coverage_ratio:.2%}")
+                            # print(f"New pixels: {new_pixels}, Covered pixels: {covered_pixels}")
                             
-                            # Create visualization for skipped masks
-                            plt.figure(figsize=(15, 5))
+                            # # Create visualization for skipped masks
+                            # plt.figure(figsize=(15, 5))
                             
-                            # Original image with centroid
-                            plt.subplot(131)
-                            plt.imshow(self.image)
-                            plt.plot(centroid[1], centroid[0], 'r+', markersize=10)
-                            plt.title('Centroid Location')
+                            # # Original image with centroid
+                            # plt.subplot(131)
+                            # plt.imshow(self.image)
+                            # plt.plot(centroid[1], centroid[0], 'r+', markersize=10)
+                            # plt.title('Centroid Location')
                             
-                            # Predicted mask
-                            plt.subplot(132)
-                            plt.imshow(predicted_mask, cmap='gray')
-                            plt.title('Predicted Mask')
+                            # # Predicted mask
+                            # plt.subplot(132)
+                            # plt.imshow(predicted_mask, cmap='gray')
+                            # plt.title('Predicted Mask')
                             
-                            # Overlap with expanded areas
-                            plt.subplot(133)
-                            overlap = np.logical_and(predicted_mask, self.expanded_areas_mask)
-                            plt.imshow(overlap, cmap='gray')
-                            plt.title('Overlap with Expanded Areas')
+                            # # Overlap with expanded areas
+                            # plt.subplot(133)
+                            # overlap = np.logical_and(predicted_mask, self.expanded_areas_mask)
+                            # plt.imshow(overlap, cmap='gray')
+                            # plt.title('Overlap with Expanded Areas')
                             
-                            plt.tight_layout()
-                            plt.show()
+                            # plt.tight_layout()
+                            # plt.show()
                             
                             continue
                         
@@ -377,15 +377,20 @@ class Segmenter:
         # The predictor expects NumPy arrays, not PyTorch tensors
         if isinstance(points, torch.Tensor):
             points = points.cpu().numpy()
+        elif isinstance(points, list):
+            points = np.array(points)
+
         if isinstance(labels, torch.Tensor):
             labels = labels.cpu().numpy()
+        elif isinstance(labels, list):
+            labels = np.array(labels)
         
         # Ensure points and labels are in the correct shape
         if len(points.shape) == 1:
             points = points.reshape(1, -1)
         if len(labels.shape) == 0:
             labels = labels.reshape(1)
-        
+
         masks, scores, logits = self.predictor.predict(
             point_coords=points,
             point_labels=labels,

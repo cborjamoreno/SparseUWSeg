@@ -1,0 +1,104 @@
+/* Common button styles */
+QPushButton {
+    border-radius: 4px;
+    padding: 5px;
+    font-family: Arial, sans-serif;  /* Use a font that supports emoji */
+}
+
+/* Select folder button */
+QPushButton.select-folder-button {
+    background-color: white;
+    color: black;
+    border: 1px solid #ccc;
+}
+QPushButton.select-folder-button:hover {
+    background-color: #f0f0f0;
+}
+
+/* Start button */
+QPushButton.start-button {
+    background-color: #2196F3;
+    color: white;
+    border: none;
+}
+QPushButton.start-button:hover {
+    background-color: #1976D2;
+}
+QPushButton.start-button:disabled {
+    background-color: #BDBDBD;
+}
+
+/* Navigation buttons (prev/next) */
+QPushButton.navigation-button {
+    background-color: #FF9800;
+    color: white;
+    border: none;
+    border-radius: 20px;
+    font-size: 20px;
+}
+QPushButton.navigation-button:hover {
+    background-color: #F57C00;
+}
+QPushButton.navigation-button:disabled {
+    background-color: #BDBDBD;
+}
+
+/* Switch button - negative state */
+QPushButton.switch-button-negative {
+    background-color: #E60000;
+    color: white;
+    border: 1px solid black;
+}
+QPushButton.switch-button-negative:hover {
+    background-color: #CC0000;
+}
+QPushButton.switch-button-negative:disabled {
+    background-color: #BDBDBD;
+}
+
+/* Switch button - positive state */
+QPushButton.switch-button-positive {
+    background-color: #00FF00;
+    color: black;
+    border: 1px solid black;
+}
+QPushButton.switch-button-positive:hover {
+    background-color: #00E600;
+}
+QPushButton.switch-button-positive:disabled {
+    background-color: #BDBDBD;
+}
+
+/* Finish button (with checkmark ✓) */
+QPushButton.finish-button {
+    background-color: #006400;
+    color: white;
+    border: none;
+    border-radius: 20px;  /* Half of the fixed size (40px) */
+    font-size: 20px;
+    min-width: 40px;
+    max-width: 40px;
+    min-height: 40px;
+    max-height: 40px;
+    padding: 0px;
+}
+QPushButton.finish-button:hover {
+    background-color: #004d00;
+}
+QPushButton.finish-button:disabled {
+    background-color: #BDBDBD;
+}
+
+/* Toggle masks button (with eye 👁️) */
+QPushButton.toggle-masks-button {
+    background-color: #9C27B0;
+    color: white;
+    border: none;
+}
+QPushButton.toggle-masks-button:hover {
+    background-color: #7B1FA2;
+}
+QPushButton.toggle-masks-button:disabled {
+    background-color: #BDBDBD;
+    opacity: 0.5;
+}
