@@ -51,20 +51,28 @@ class ClickableLabel(QLabel):
         super().mouseMoveEvent(event)
 
 # Thread to generate the initial proposed point using an existing segmenter
+# Update the MaskingThread to pass the necessary parameters
 class MaskingThread(QThread):
-    result_ready = pyqtSignal(tuple)  # Signal emitting the final result
-    error_occurred = pyqtSignal(str)  # Signal for handling errors (optional)
+    result_ready = pyqtSignal(tuple)
+    error_occurred = pyqtSignal(str)
 
-    def __init__(self, segmenter, parent=None):
+    def __init__(self, segmenter, label_predictor=None, expanded_masks=None, parent=None):
         super(MaskingThread, self).__init__(parent)
         self.segmenter = segmenter
+        self.label_predictor = label_predictor
+        self.expanded_masks = expanded_masks
 
     def run(self):
         try:
-            best_point = self.segmenter.get_best_point()
+            best_point = self.segmenter.get_best_point(
+                label_predictor=self.label_predictor,
+                expanded_masks=self.expanded_masks
+            )
             self.result_ready.emit(best_point)
         except Exception as e:
             self.error_occurred.emit(str(e))
+            import traceback
+            traceback.print_exc()
 
 # Thread to expand the user-selected point into a mask using an existing segmenter
 class MaskExpansionThread(QThread):
@@ -226,6 +234,8 @@ class ImageViewer(QWidget):
         self.is_over_mask = False
         self.current_mask_index = None
         self.masks_visible = True
+        self.automatic_masks = None  # Will store SAM's automatic masks
+        self.auto_label_threshold = 0.75  # Similarity threshold for auto-labeling
 
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder with Images")
@@ -292,8 +302,124 @@ class ImageViewer(QWidget):
 
         if self.segmenter is None:
             self.segmenter = Segmenter(self.current_image, sam_checkpoint, sam2_checkpoint, sam2_cfg)
+            
+            # Get automatic mask candidates when segmenter is initialized
+            wait_dialog.setWindowTitle("Generating Proposed Point")
+            wait_layout = wait_dialog.layout()
+            wait_layout.itemAt(0).widget().setText("Analyzing image for potential objects...")
+            QApplication.processEvents()
+            
+            # Get automatic masks from SAM
+            self.automatic_masks = self.segmenter.masks
+            print(f"Found {len(self.automatic_masks)} potential objects")
+            
+            # Pre-filter masks by size to reduce processing
+            filtered_masks = []
+            for mask_data in self.automatic_masks:
+                mask = mask_data['segmentation']
+                mask_area = np.sum(mask)
+                if 100 <= mask_area <= (self.current_image.shape[0] * self.current_image.shape[1] * 0.8):
+                    filtered_masks.append(mask_data)
+            
+            self.automatic_masks = filtered_masks
+            print(f"Filtered to {len(self.automatic_masks)} valid objects by size")
+            
+            # Check if we have any prototypes for auto-labeling
+            has_prototypes = hasattr(self.label_predictor, 'prototypes') and self.label_predictor.prototypes
+            
+            if has_prototypes:
+                wait_layout.itemAt(0).widget().setText("Auto-labeling objects with existing classes...")
+                QApplication.processEvents()
+                
+                # Process in batches
+                batch_size = 10
+                auto_labeled_count = 0
+                newly_labeled_masks = []
+                
+                for i in range(0, len(self.automatic_masks), batch_size):
+                    batch = self.automatic_masks[i:i+batch_size]
+                    wait_layout.itemAt(0).widget().setText(f"Processing objects {i+1}-{min(i+batch_size, len(self.automatic_masks))} of {len(self.automatic_masks)}...")
+                    QApplication.processEvents()
+                    
+                    # Process each mask in the batch
+                    for mask_data in batch:
+                        try:
+                            mask = mask_data['segmentation']
+                            
+                            # Skip if this mask overlaps with existing masks
+                            if self.is_mask_overlapping(mask):
+                                continue
+                            
+                            # Extract features for this mask
+                            features = self.label_predictor._extract_features(self.current_image, mask)
+                            embedding = self.label_predictor._compute_mask_embedding(features, mask)
+                            
+                            if embedding is None:
+                                continue
+                            
+                            # Check if we should auto-assign a label
+                            should_auto, predicted_label = self.label_predictor.should_auto_assign(
+                                self.current_image, 
+                                mask,
+                                mask_embedding=embedding,  # Pass embedding to avoid recomputing
+                                threshold=self.auto_label_threshold
+                            )
+                            
+                            if should_auto and predicted_label in self.labels:
+                                # Auto-assign the label
+                                color = self.labels[predicted_label]
+                                
+                                # Add to expanded masks (but don't update visuals yet)
+                                self.expanded_masks.append((mask, predicted_label, color))
+                                
+                                # Track for removal from automatic_masks
+                                newly_labeled_masks.append(mask)
+                                auto_labeled_count += 1
+                                
+                                # Add to the training data
+                                self.label_predictor.add_example(self.current_image, mask, predicted_label, features=features)
+                                
+                                print(f"Auto-labeled object as '{predicted_label}' (at startup)")
+                        except Exception as e:
+                            print(f"Error processing mask: {e}")
+                    
+                    # Force GC after each batch
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                
+                # Now update the visual overlay once for all new masks
+                if auto_labeled_count > 0:
+                    # Update combined mask overlay
+                    self.regenerate_combined_mask_overlay()
+                    
+                    # Enable masks button if we have masks now
+                    self.toggle_masks_button.setEnabled(True)
+                    
+                    print(f"✓ Auto-labeled {auto_labeled_count} objects at startup")
+                    
+                    # Add this section: Mark auto-labeled masks as selected in the segmenter
+                    if hasattr(self, 'segmenter') and hasattr(self.segmenter, 'point_selector'):
+                        for mask_data in self.automatic_masks:
+                            if any(np.array_equal(mask_data['segmentation'], mask) for mask in newly_labeled_masks):
+                                # Mark this mask as selected so it won't be suggested again
+                                self.segmenter.selected_masks.add(id(mask_data))
+                                # Also add its centroid to selected points
+                                segmentation = mask_data['segmentation']
+                                indices = list(zip(*segmentation.nonzero()))
+                                if indices:
+                                    centroid = np.mean(indices, axis=0)
+                                    self.segmenter.selected_points.append(np.array(centroid.astype(int)))
+                    
+                    # Remove the auto-labeled masks from future consideration
+                    self.automatic_masks = [m for m in self.automatic_masks 
+                                           if not any(np.array_equal(m['segmentation'], mask) for mask in newly_labeled_masks)]
 
-        self.masking_thread = MaskingThread(self.segmenter)
+        self.masking_thread = MaskingThread(
+            self.segmenter, 
+            label_predictor=self.label_predictor,
+            expanded_masks=self.expanded_masks
+        )
         self.masking_thread.result_ready.connect(lambda best_point: self.on_masking_complete(best_point, wait_dialog))
         self.masking_thread.start()
 
@@ -395,7 +521,7 @@ class ImageViewer(QWidget):
         self.update_display(overlay_image)
 
     def delete_mask(self, mask_index):
-        """Delete a mask and update the display"""
+        """Delete a mask, remove from database, and update the contrastive model"""
         if not (0 <= mask_index < len(self.expanded_masks)):
             return
             
@@ -413,6 +539,30 @@ class ImageViewer(QWidget):
         self.is_over_mask = False
         self.setCursor(Qt.CursorShape.ArrowCursor)
         
+        # IMPORTANT: Update the contrastive learning model
+        if hasattr(self, 'label_predictor'):
+            print(f"\n===== UPDATING CONTRASTIVE MODEL =====")
+            print(f"Removing deleted mask with label '{label}'")
+            
+            # Remove the example from the database
+            self.label_predictor.remove_example(mask, label)
+            
+            # Retrain the contrastive model if needed
+            class_counts = {label: len(examples) for label, examples in 
+                           self.label_predictor.feature_database.items()}
+            
+            # Check if we have enough data to perform contrastive training
+            classes_with_examples = sum(1 for count in class_counts.values() if count > 0)
+            
+            if classes_with_examples >= 2:
+                print("Retraining contrastive model...")
+                self.label_predictor.train_contrastive_optimized(epochs=10, margin=0.5)
+                print(f"✓ Contrastive model retrained successfully")
+            else:
+                print(f"Not enough classes ({classes_with_examples}) for contrastive learning")
+            
+            print("========================================\n")
+        
         # Print informative message
         print(f"Deleted mask with label '{label}'")
         
@@ -420,7 +570,7 @@ class ImageViewer(QWidget):
         self.update_display_with_current_state()
 
     def change_mask_label(self, mask_index):
-        """Change the label of a mask"""
+        """Change the label of a mask and update the contrastive learning model"""
         if not (0 <= mask_index < len(self.expanded_masks)):
             return
             
@@ -445,6 +595,37 @@ class ImageViewer(QWidget):
                 self.regenerate_combined_mask_overlay()
                 
                 print(f"Changed mask label from '{old_label}' to '{new_label}'")
+                
+                # IMPORTANT: Update the contrastive learning model
+                if hasattr(self, 'label_predictor'):
+                    print(f"\n===== UPDATING CONTRASTIVE MODEL =====")
+                    print(f"Removing example with label '{old_label}'")
+                    print(f"Adding example with new label '{new_label}'")
+                    
+                    # Extract features for this mask
+                    features = self.label_predictor._extract_features(self.current_image, mask)
+                    
+                    # Remove the old example
+                    self.label_predictor.remove_example(mask, old_label)
+                    
+                    # Add the new example
+                    self.label_predictor.add_example(self.current_image, mask, new_label, features=features)
+                    
+                    # Retrain the contrastive model
+                    class_counts = {label: len(examples) for label, examples in 
+                                   self.label_predictor.feature_database.items()}
+                    
+                    # Check if we have enough data to perform contrastive training
+                    classes_with_examples = sum(1 for count in class_counts.values() if count > 0)
+                    
+                    if classes_with_examples >= 2:
+                        print("Retraining contrastive model...")
+                        self.label_predictor.train_contrastive_optimized(epochs=10, margin=0.5)
+                        print(f"✓ Contrastive model retrained successfully")
+                    else:
+                        print(f"Not enough classes ({classes_with_examples}) for contrastive learning")
+                    
+                    print("========================================\n")
                 
                 # Update the display
                 self.update_display_with_current_state()
@@ -643,7 +824,10 @@ class ImageViewer(QWidget):
                 
                 # Get new candidate points with updated state
                 if hasattr(self, 'segmenter'):
-                    self.suggested_point = self.segmenter.get_best_point()
+                    self.suggested_point = self.segmenter.get_best_point(
+                        label_predictor=self.label_predictor,
+                        expanded_masks=self.expanded_masks
+                    )
                 
                 self.update_display(overlay_image)
                 
@@ -731,6 +915,133 @@ class ImageViewer(QWidget):
         if self.current_point_type == "negative":
             self.switch_point_type()  # Reset to positive if it was negative
 
+        # Look for similar automatic masks to apply the same label
+        if self.automatic_masks and mask is not None and self.current_label:
+            auto_labeled_count = 0
+            newly_labeled_masks = []
+            
+            print(f"\nSearching for objects similar to '{self.current_label}'...")
+            
+            # Extract features for the newly created mask once
+            new_features = self.label_predictor._extract_features(self.current_image, mask)
+            new_embedding = self.label_predictor._compute_mask_embedding(new_features, mask)
+            
+            if new_embedding is not None:
+                # Use batch approach again for consistency
+                batch_size = 10
+                
+                for i in range(0, len(self.automatic_masks), batch_size):
+                    batch = self.automatic_masks[i:i+batch_size]
+                    
+                    # Process each mask in the batch
+                    for mask_data in batch:
+                        try:
+                            candidate_mask = mask_data['segmentation']
+                            
+                            # Skip if this mask overlaps with existing masks
+                            if self.is_mask_overlapping(candidate_mask):
+                                continue
+                            
+                            # Use pre-computed embedding if available
+                            candidate_embedding = mask_data.get('embedding')
+                            
+                            # Re-compute only if necessary
+                            if candidate_embedding is None:
+                                # We need to extract features only for this specific mask
+                                candidate_features = self.label_predictor._extract_features(self.current_image, candidate_mask)
+                                candidate_embedding = self.label_predictor._compute_mask_embedding(candidate_features, candidate_mask)
+                                mask_data['embedding'] = candidate_embedding
+                            
+                            if candidate_embedding is None:
+                                continue
+                            
+                            # Calculate similarity using embeddings
+                            similarity = cosine_similarity(
+                                np.array(new_embedding).reshape(1, -1),
+                                np.array(candidate_embedding).reshape(1, -1)
+                            )[0][0]
+                            
+                            # If similar enough, auto-apply the label
+                            if similarity > self.auto_label_threshold:
+                                # Use the same color as the current label
+                                color = self.labels.get(self.current_label)
+                                
+                                # Add to expanded masks (without updating visuals yet)
+                                self.expanded_masks.append((candidate_mask, self.current_label, color))
+                                
+                                # Track for removal
+                                newly_labeled_masks.append(candidate_mask)
+                                auto_labeled_count += 1
+                                
+                                # Now we need to extract full features again for training
+                                # This is a necessary expense to maintain prediction quality
+                                candidate_features = self.label_predictor._extract_features(self.current_image, candidate_mask)
+                                self.label_predictor.add_example(self.current_image, candidate_mask, 
+                                                                 self.current_label, features=candidate_features)
+                                
+                                # Delete features immediately to save memory
+                                del candidate_features
+                                
+                                print(f"Auto-labeled object as '{self.current_label}' (similarity: {similarity:.3f})")
+                        
+                        except Exception as e:
+                            print(f"Error comparing masks: {e}")
+                    
+                    # Aggressively clean up after each batch
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                    
+                # Rest of the code for updating display
+                if auto_labeled_count > 0:
+                    # Generate the combined overlay
+                    self.regenerate_combined_mask_overlay()
+                    
+                    # Now update the display
+                    self.update_display_with_current_state()
+                    
+                    print(f"✓ Auto-labeled {auto_labeled_count} objects with the label '{self.current_label}'")
+                    
+                    # Add this section: Mark auto-labeled masks as selected in the segmenter
+                    if hasattr(self, 'segmenter') and hasattr(self.segmenter, 'point_selector'):
+                        for mask_data in self.automatic_masks:
+                            if any(np.array_equal(mask_data['segmentation'], mask) for mask in newly_labeled_masks):
+                                # Mark this mask as selected so it won't be suggested again
+                                self.segmenter.selected_masks.add(id(mask_data))
+                                # Also add its centroid to selected points
+                                segmentation = mask_data['segmentation']
+                                indices = list(zip(*segmentation.nonzero()))
+                                if indices:
+                                    centroid = np.mean(indices, axis=0)
+                                    self.segmenter.selected_points.append(np.array(centroid.astype(int)))
+                    
+                    # Remove the auto-labeled masks from future consideration
+                    self.automatic_masks = [m for m in self.automatic_masks 
+                                           if not any(np.array_equal(m['segmentation'], mask) for mask in newly_labeled_masks)]
+                    
+                    # Modified code to track auto-labeled masks more reliably
+                    for i, (candidate_mask, _, _) in enumerate(self.expanded_masks[-auto_labeled_count:]):
+                        # These are the newly added masks
+                        mask_id = id(candidate_mask)  # Get unique ID for this mask
+                        
+                        # Explicitly add to segmenter's tracking sets
+                        if hasattr(self, 'segmenter'):
+                            # Add mask ID to explicitly mark as processed
+                            self.segmenter.selected_masks.add(mask_id)
+                            
+                            # Find and store centroid
+                            indices = list(zip(*candidate_mask.nonzero()))
+                            if indices:
+                                centroid = np.mean(indices, axis=0)
+                                # Cast to int to avoid floating point issues
+                                centroid_point = np.array([int(centroid[0]), int(centroid[1])])
+                                self.segmenter.selected_points.append(centroid_point)
+                                print(f"Tracking mask {mask_id} with centroid: {centroid_point}")
+                        
+                        # Also track the mask in the rejection set for double safety
+                        if hasattr(self, 'segmenter') and hasattr(self.segmenter, 'rejected_masks'):
+                            self.segmenter.rejected_masks.add(mask_id)
+
     def toggle_masks_visibility(self):
         """Toggle the visibility of all masks"""
         self.masks_visible = not self.masks_visible
@@ -817,7 +1128,7 @@ class ImageViewer(QWidget):
         if image_pos is None:
             # If we have points, show expansion with just the existing points
             if self.positive_points or self.negative_points:
-                # Start with original image and add cached overlay if visible
+                # Start with original image and add cached overlay if masks are visible
                 overlay_image = self.current_image.copy()
                 if self.masks_visible and self.combined_mask_overlay is not None:
                     overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.6, 0)
@@ -1423,6 +1734,27 @@ class ImageViewer(QWidget):
         
         # Call the parent class handler
         super().keyPressEvent(event)
+
+    def is_mask_overlapping(self, new_mask):
+        """Check if a mask has significant overlap with any existing mask"""
+        if not self.expanded_masks:
+            return False
+        
+        # Calculate total new mask area
+        new_mask_area = np.sum(new_mask)
+        if new_mask_area == 0:
+            return False
+        
+        # Check against each existing mask
+        for mask, _, _ in self.expanded_masks:
+            overlap = np.logical_and(mask, new_mask)
+            overlap_area = np.sum(overlap)
+            
+            # If more than 25% overlaps with existing mask, consider it overlapping
+            if overlap_area / new_mask_area > 0.25:
+                return True
+        
+        return False
 
 # Run the application
 app = QApplication(sys.argv)

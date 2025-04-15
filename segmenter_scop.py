@@ -3,6 +3,7 @@ import torch
 import matplotlib.pyplot as plt
 import sys
 import os
+import cv2
 
 # Add the current directory to the Python path to find the local segment_anything folder
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -54,6 +55,11 @@ class Segmenter:
         print(f"Generated {len(self.masks)} masks")
 
         self.selected_masks = set()
+        self.selected_points = []  # Add this line
+        self.rejected_masks = set()  # Add this line too for completeness
+        
+        # Initialize the point selector
+        self.point_selector = PointSelector(self.height, self.width, self)
 
     def _generate_masks(self):
         """
@@ -255,108 +261,19 @@ class Segmenter:
 
         return best_index
 
-    def get_best_point(self):
+    def get_best_point(self, label_predictor=None, expanded_masks=None):
         """
-        Get the best point by:
-        1. Use pre-sorted masks (sorted by predicted expansion area)
-        2. Compare predicted mask with the overall expanded areas mask using coverage percentage
-        3. Return the centroid of the first unselected mask that would expand to a sufficiently uncovered area
+        Delegate to PointSelector to get the best point for labeling.
+        
+        Args:
+            label_predictor: Optional LabelPredictor with trained prototypes
+            expanded_masks: List of already expanded masks to avoid
+            
+        Returns:
+            (row, col) tuple of the suggested point position
         """
-        if not hasattr(self, 'selected_points'):
-            self.selected_points = []
-        if not hasattr(self, 'rejected_masks'):
-            self.rejected_masks = set()
         
-        # Define coverage threshold (if more than 30% of the new mask is already covered, skip it)
-        COVERAGE_THRESHOLD = 0.3
-        # Define distance threshold for skipping nearby points (3 pixels)
-        DISTANCE_THRESHOLD = 5
-        
-        # Get centroid of first unselected mask that would expand to a sufficiently uncovered area
-        for mask in self.masks:
-            # Skip if mask is already selected or rejected
-            if id(mask) in self.selected_masks or id(mask) in self.rejected_masks:
-                continue
-                
-            segmentation = mask['segmentation']
-            indices = list(zip(*segmentation.nonzero()))
-            if indices:
-                # Calculate centroid in [y, x] format for display
-                centroid = np.mean(indices, axis=0)
-                
-                # Skip if centroid is too close to any already selected point
-                is_near_selected = False
-                for selected_point in self.selected_points:
-                    distance = np.sqrt(np.sum((centroid - selected_point) ** 2))
-                    if distance <= DISTANCE_THRESHOLD:
-                        is_near_selected = True
-                        break
-                
-                if is_near_selected:
-                    print(f"Skipping mask at centroid ({int(centroid[0])}, {int(centroid[1])}) - too close to selected point")
-                    self.rejected_masks.add(id(mask))
-                    continue
-                
-                # Convert to [x, y] format for prediction
-                point = np.array([[centroid[1], centroid[0]]])
-                labels = np.array([1])
-                
-                # Predict expansion for this centroid
-                masks, scores, logits = self.predictor.predict(
-                    point_coords=point,
-                    point_labels=labels,
-                    multimask_output=True,
-                )
-                
-                if masks is not None:
-                    best_mask_idx = self._weighted_mask_selection(masks, scores)
-                    predicted_mask = masks[best_mask_idx]
-                    
-                    # Calculate how much of the new mask is already covered
-                    # Count pixels that are in the new mask but not in the overall mask
-                    new_pixels = np.sum(predicted_mask)
-                    if new_pixels > 0:  # Avoid division by zero
-                        covered_pixels = np.sum(np.logical_and(predicted_mask, self.expanded_areas_mask))
-                        coverage_ratio = covered_pixels / new_pixels
-                        
-                        if coverage_ratio >= COVERAGE_THRESHOLD:
-                            # Add to rejected masks and continue to next mask
-                            self.rejected_masks.add(id(mask))
-                            # print(f"Skipping mask at centroid ({int(centroid[0])}, {int(centroid[1])})")
-                            # print(f"Coverage ratio: {coverage_ratio:.2%}")
-                            # print(f"New pixels: {new_pixels}, Covered pixels: {covered_pixels}")
-                            
-                            # # Create visualization for skipped masks
-                            # plt.figure(figsize=(15, 5))
-                            
-                            # # Original image with centroid
-                            # plt.subplot(131)
-                            # plt.imshow(self.image)
-                            # plt.plot(centroid[1], centroid[0], 'r+', markersize=10)
-                            # plt.title('Centroid Location')
-                            
-                            # # Predicted mask
-                            # plt.subplot(132)
-                            # plt.imshow(predicted_mask, cmap='gray')
-                            # plt.title('Predicted Mask')
-                            
-                            # # Overlap with expanded areas
-                            # plt.subplot(133)
-                            # overlap = np.logical_and(predicted_mask, self.expanded_areas_mask)
-                            # plt.imshow(overlap, cmap='gray')
-                            # plt.title('Overlap with Expanded Areas')
-                            
-                            # plt.tight_layout()
-                            # plt.show()
-                            
-                            continue
-                        
-                        # If we get here, the mask is valid
-                        self.selected_masks.add(id(mask))
-                        self.selected_points.append(centroid)
-                        return tuple(centroid.astype(int))
-        
-        return None
+        return self.point_selector.get_best_point(label_predictor, expanded_masks)
     
     def propagate_points(self, points, labels, update_expanded_mask=True):
         """
@@ -437,17 +354,19 @@ class Segmenter:
 
 
 class PointSelector:
-    def __init__(self, height, width, grid_size=8):
+    def __init__(self, height, width, segmenter, grid_size=8):
         """
         Initialize the point selector.
         
         Args:
             height (int): Image height
             width (int): Image width
+            segmenter: Reference to the parent segmenter
             grid_size (int): Number of grid cells in each dimension
         """
         self.height = height
         self.width = width
+        self.segmenter = segmenter
         self.grid_size = grid_size
         self.grid_h = height // grid_size
         self.grid_w = width // grid_size
@@ -671,4 +590,338 @@ class PointSelector:
             axes[plot_idx].legend()
 
         plt.tight_layout()
-        plt.show() 
+        plt.show()
+    
+    def get_best_point(self, label_predictor=None, expanded_masks=None):
+        """
+        Get the best point for labeling, prioritizing:
+        1. Least similar to known classes (encouraging new class discovery)
+        2. Significant area (favoring larger objects)
+        3. Not overlapping with already expanded masks
+        
+        Args:
+            label_predictor: Optional LabelPredictor with trained prototypes
+            expanded_masks: List of already expanded masks to avoid
+            
+        Returns:
+            (row, col) tuple of the suggested point position
+        """
+        # Define constants
+        COVERAGE_THRESHOLD = 0.3
+        DISTANCE_THRESHOLD = 5
+        
+        # Check if we can use contrastive learning
+        use_contrastive = (label_predictor is not None and 
+                           hasattr(label_predictor, 'prototypes') and 
+                           label_predictor.prototypes)
+        
+        if use_contrastive:
+            print("\n===== INTELLIGENT POINT SUGGESTION =====")
+            print("Using contrastive learning to find dissimilar objects...")
+        
+        # Collect candidate masks with scores
+        candidates = []
+        
+        # Process each mask
+        for mask in self.segmenter.masks:
+            # Skip if mask is already selected or rejected
+            if id(mask) in self.segmenter.selected_masks or id(mask) in self.segmenter.rejected_masks:
+                continue
+                
+            segmentation = mask['segmentation']
+            indices = list(zip(*segmentation.nonzero()))
+            if not indices:
+                continue
+                
+            # Calculate centroid in [y, x] format for display
+            centroid = np.mean(indices, axis=0)
+            cent_y, cent_x = int(centroid[0]), int(centroid[1])
+            
+            # NEW CODE: Direct check if centroid falls within any existing mask
+            if expanded_masks:
+                centroid_in_mask = False
+                for i, (mask_obj, label, _) in enumerate(expanded_masks):
+                    # Double-check bounds
+                    if 0 <= cent_y < mask_obj.shape[0] and 0 <= cent_x < mask_obj.shape[1]:
+                        if mask_obj[cent_y, cent_x]:
+                            print(f"Point {(cent_y, cent_x)} overlaps mask #{i} with label '{label}'")
+                            centroid_in_mask = True
+                            break
+            
+                if centroid_in_mask:
+                    self.segmenter.rejected_masks.add(id(mask))
+                    continue
+            
+            # Skip if centroid is too close to any already selected point
+            is_near_selected = False
+            for selected_point in self.segmenter.selected_points:
+                distance = np.sqrt(np.sum((centroid - selected_point) ** 2))
+                if distance <= DISTANCE_THRESHOLD:
+                    is_near_selected = True
+                    break
+            
+            if is_near_selected:
+                self.segmenter.rejected_masks.add(id(mask))
+                continue
+            
+            # Convert to [x, y] format for prediction
+            point = np.array([[centroid[1], centroid[0]]])
+            labels = np.array([1])
+            
+            # Predict expansion for this centroid
+            masks, scores, logits = self.segmenter.predictor.predict(
+                point_coords=point,
+                point_labels=labels,
+                multimask_output=True,
+            )
+            
+            if masks is None:
+                continue
+                
+            best_mask_idx = self.segmenter._weighted_mask_selection(masks, scores)
+            predicted_mask = masks[best_mask_idx]
+            
+            # Check overlap with expanded areas
+            new_pixels = np.sum(predicted_mask)
+            if new_pixels == 0:
+                continue
+                
+            if expanded_masks:
+                # Check overlap with provided expanded_masks
+                is_overlapping = False
+                for mask_obj, _, _ in expanded_masks:
+                    overlap = np.logical_and(predicted_mask, mask_obj)
+                    overlap_area = np.sum(overlap)
+                    if overlap_area / new_pixels >= COVERAGE_THRESHOLD:
+                        is_overlapping = True
+                        break
+                
+                if is_overlapping:
+                    self.segmenter.rejected_masks.add(id(mask))
+                    continue
+            else:
+                # Use the original expanded_areas_mask if available
+                if hasattr(self.segmenter, 'expanded_areas_mask') and self.segmenter.expanded_areas_mask is not None:
+                    covered_pixels = np.sum(np.logical_and(predicted_mask, self.segmenter.expanded_areas_mask))
+                    coverage_ratio = covered_pixels / new_pixels
+                    
+                    if coverage_ratio >= COVERAGE_THRESHOLD:
+                        self.segmenter.rejected_masks.add(id(mask))
+                        continue
+            
+            # First, add absolute size filtering before any scoring
+            mask_area = np.sum(predicted_mask)
+            min_pixels = 500  # Minimum size threshold
+            if mask_area < min_pixels:
+                # Skip tiny masks entirely
+                self.segmenter.rejected_masks.add(id(mask))
+                continue
+
+            # Now add contrastive learning logic
+            if use_contrastive:
+                # Extract features and embedding for this mask
+                try:
+                    features = label_predictor._extract_features(self.segmenter.image, predicted_mask)
+                    embedding = label_predictor._compute_mask_embedding(features, predicted_mask)
+                    
+                    if embedding is not None:
+                        # Calculate similarity to every known class
+                        similarities = []
+                        for label, prototype in label_predictor.prototypes.items():
+                            try:
+                                from sklearn.metrics.pairwise import cosine_similarity
+                                sim = cosine_similarity(
+                                    np.array(embedding).reshape(1, -1),
+                                    np.array(prototype).reshape(1, -1)
+                                )[0][0]
+                                similarities.append((label, sim))
+                            except Exception as e:
+                                continue
+                        
+                        if similarities:
+                            # Sort similarities (highest first)
+                            similarities.sort(key=lambda x: x[1], reverse=True)
+                            similarity = similarities[0][1]
+                            closest_class = similarities[0][0]
+                            
+                            # Calculate dissimilarity score (higher is more different)
+                            dissimilarity = 1.0 - max(0.0, similarity)
+                            
+                            # Calculate area score (higher is larger)
+                            # Then change how normalized_area is calculated
+                            # Use a sigmoid-like function that heavily penalizes small areas
+                            # and rewards masks that are a reasonable size (not too small, not too big)
+                            normalized_area = min(1.0, mask_area / (self.height * self.width * 0.05))
+
+                            # For very small masks, apply an exponential penalty
+                            if normalized_area < 0.01:  # Masks smaller than 1% of "reasonable size"
+                                normalized_area *= normalized_area  # Square it to heavily penalize tiny masks
+
+                            # Adjust the score weighting to balance size and dissimilarity
+                            combined_score = 0.5 * dissimilarity + 0.5 * normalized_area  # Equal weighting
+                            
+                            # Add to candidates
+                            candidates.append({
+                                'point': tuple(centroid.astype(int)),
+                                'mask_id': id(mask),
+                                'score': combined_score,
+                                'dissimilarity': dissimilarity,
+                                'closest_class': closest_class,
+                                'similarity': similarity,
+                                'area': normalized_area
+                            })
+                            continue  # Skip the default scoring
+                except Exception as e:
+                    print(f"Error in contrastive scoring: {e}")
+            
+            # Default scoring if contrastive learning is not available
+            candidates.append({
+                'point': tuple(centroid.astype(int)),
+                'mask_id': id(mask),
+                'score': 0.5,  # Default middle score
+                'dissimilarity': 0.5,
+                'closest_class': None,
+                'similarity': 0.0,
+                'area': min(1.0, new_pixels / (self.height * self.width * 0.2))
+            })
+        
+        # If no candidates, return center point
+        if not candidates:
+            print("No suitable candidates found, using default point")
+            return (self.height // 2, self.width // 2)
+        
+        # Sort by combined score (highest first)
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        
+        # Print top candidates if using contrastive learning
+        if use_contrastive:
+            print("\nTop suggestions:")
+            for i, cand in enumerate(candidates[:3]):
+                if i >= len(candidates):
+                    break
+                print(f"{i+1}. Point: {cand['point']} | " +
+                     f"Score: {cand['score']:.3f} | " +
+                     f"Dissimilarity: {cand['dissimilarity']:.3f}" +
+                     (f" | Closest class: '{cand['closest_class']}' ({cand['similarity']:.3f})" 
+                      if cand['closest_class'] else "") +
+                     f" | Area: {cand['area']:.3f}")
+            
+            print(f"Selected point: {candidates[0]['point']}")
+            print("========================================\n")
+        
+        # Mark the best candidate as selected
+        best_candidate = candidates[0]
+        point_yx = best_candidate['point']  # Already in [y, x] format
+        
+        # Store in segmenter for future reference
+        self.segmenter.selected_masks.add(best_candidate['mask_id'])
+        self.segmenter.selected_points.append(np.array(point_yx))
+        
+        # Debug print to verify coordinates
+        print(f"Selected point [y={point_yx[0]}, x={point_yx[1]}] (row, col)")
+        
+        if candidates and use_contrastive:
+            # Debug visualization for top candidate
+            best_candidate = candidates[0]
+            best_mask_id = best_candidate['mask_id']
+            
+            # Find the corresponding mask object
+            for mask in self.segmenter.masks:
+                if id(mask) == best_mask_id:
+                    # Get mask segmentation and show debug visualization
+                    segmentation = mask['segmentation']
+                    point_yx = best_candidate['point']
+                    print(f"Showing visualization of SUGGESTED POINT: {point_yx}")
+                    self.debug_show_candidate_mask(
+                        self.segmenter.image, 
+                        segmentation, 
+                        point_yx,
+                        title=f"SUGGESTED POINT [y={point_yx[0]}, x={point_yx[1]}]"
+                    )
+                    break
+        
+        return point_yx  # Return in [y, x] format
+
+    def debug_show_candidate_mask(self, image, mask, centroid, title=None):
+        """Save debug visualization to file instead of displaying it."""
+        import matplotlib.pyplot as plt
+        import os
+        import time
+        
+        # Create output directory
+        os.makedirs("debug_plots", exist_ok=True)
+        
+        # Create a figure with three subplots for better debugging
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        
+        # Generate a filename
+        y, x = int(centroid[0]), int(centroid[1])
+        timestamp = int(time.time())
+        filename = f"point_y{y}_x{x}_{timestamp}.png"
+        filepath = os.path.join("debug_plots", filename)
+        
+        # Use custom title if provided
+        if title:
+            plt.suptitle(title, fontsize=16, color='blue')
+        else:
+            # Check if the centroid is in the mask
+            is_in_mask = mask[y, x] > 0 if 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1] else False
+            plt.suptitle(f"Centroid in mask: {'YES' if is_in_mask else 'NO'}", 
+                       fontsize=16, color='green' if is_in_mask else 'red')
+        
+        # 1. Original image with centroid
+        axes[0].imshow(image)
+        axes[0].scatter(x, y, c='red', marker='+', s=100)
+        axes[0].set_title(f'Centroid at [y={y}, x={x}]')
+        axes[0].axis('off')
+        
+        # 2. Binary mask only
+        axes[1].imshow(mask, cmap='gray')
+        axes[1].scatter(x, y, c='yellow', marker='+', s=100)
+        axes[1].set_title('Binary Mask')
+        axes[1].axis('off')
+        
+        # 3. Mask overlay with centroid
+        mask_overlay = image.copy()
+        mask_rgb = np.zeros_like(image)
+        mask_rgb[mask > 0] = [255, 0, 0]  # Red for the mask
+        mask_overlay = cv2.addWeighted(mask_overlay, 1.0, mask_rgb, 0.5, 0)
+        
+        axes[2].imshow(mask_overlay)
+        axes[2].scatter(x, y, c='yellow', marker='+', s=100)
+        axes[2].set_title('Mask Overlay')
+        axes[2].axis('off')
+        
+        plt.tight_layout()
+        
+        # Save to file instead of showing
+        plt.savefig(filepath)
+        plt.close(fig)
+        
+        print(f"Debug plot saved to: {filepath}")
+        
+        # If the centroid is not in the mask, save a second plot with the true centroid
+        is_in_mask = mask[y, x] > 0 if 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1] else False
+        if not is_in_mask:
+            indices = list(zip(*mask.nonzero()))
+            if indices:
+                true_centroid = np.mean(indices, axis=0)
+                true_y, true_x = int(true_centroid[0]), int(true_centroid[1])
+                
+                print(f"WARNING: Provided centroid {(y, x)} is not in the mask!")
+                print(f"True mask centroid would be at {(true_y, true_x)}")
+                
+                # Create a new figure showing both centroids
+                fig, ax = plt.subplots(figsize=(8, 8))
+                ax.imshow(mask_overlay)
+                ax.scatter(x, y, c='red', marker='x', s=150, label='Original')
+                ax.scatter(true_x, true_y, c='lime', marker='+', s=150, label='True centroid')
+                ax.set_title('Corrected Centroid')
+                ax.legend()
+                ax.axis('off')
+                
+                corrected_filepath = os.path.join("debug_plots", f"corrected_{filename}")
+                plt.savefig(corrected_filepath)
+                plt.close(fig)
+                
+                print(f"Corrected centroid plot saved to: {corrected_filepath}")

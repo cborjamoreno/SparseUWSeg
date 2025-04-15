@@ -147,11 +147,22 @@ class LabelPredictor:
         mask_features = spatial_features[:, mask_coords[:, 0], mask_coords[:, 1]]
         return np.mean(mask_features, axis=1)
     
-    def add_example(self, image: np.ndarray, mask: np.ndarray, label: str) -> None:
-        """Add a new labeled example to the feature database."""
+    def add_example(self, image: np.ndarray, mask: np.ndarray, label: str, features=None) -> None:
+        """Add a new labeled example to the feature database.
+        
+        Args:
+            image: The source image
+            mask: Binary mask of the object
+            label: The class label to assign
+            features: Optional pre-computed features to use instead of extracting them
+        """
         # Extract spatial features if needed
-        if self.spatial_features is None:
-            self.spatial_features = self._extract_features(image)  # Ensure correct invocation
+        if features is not None:
+            # Use pre-computed features that were passed in
+            self.spatial_features = features
+        elif self.spatial_features is None:
+            # Extract features from scratch
+            self.spatial_features = self._extract_features(image)
         
         # Compute mask embedding
         mask_embedding = self._compute_mask_embedding(self.spatial_features, mask)
@@ -180,7 +191,6 @@ class LabelPredictor:
         # Update prototype
         self._update_prototype(label)
 
-
     def _update_prototype(self, label: str) -> None:
         """Update the prototype vector for a label using contrastive learning."""
         if label in self.feature_database and len(self.feature_database[label]) > 1:
@@ -197,17 +207,33 @@ class LabelPredictor:
             self.prototypes[label] = torch.mean(embeddings, dim=0).numpy()
 
     def predict_label(self, image: np.ndarray, mask: np.ndarray, 
-                     top_k: int = 3, force_prediction: bool = True) -> List[Tuple[str, float]]:
-        """Predict label for a new mask."""
-        if not self.prototypes:
+                     top_k: int = 3, force_prediction: bool = True, embedding=None) -> List[Tuple[str, float]]:
+        """Predict label for a new mask.
+        
+        Args:
+            image: Source image
+            mask: Binary mask of the object
+            top_k: Number of top predictions to return
+            force_prediction: If True, returns predictions even if below min_examples_per_class
+            embedding: Optional pre-computed embedding to avoid feature extraction
+            
+        Returns:
+            List of (label, probability) tuples, sorted by probability
+        """
+        # If no prototypes yet, can't predict
+        if not hasattr(self, 'prototypes') or not self.prototypes:
             return []
-        
-        # Extract features if needed
-        if self.spatial_features is None:
-            self.spatial_features = self._extract_features(image)
-        
-        # Compute mask embedding
-        new_mask_embedding = self._compute_mask_embedding(self.spatial_features, mask)
+            
+        # Use provided embedding or compute it
+        new_mask_embedding = embedding
+        if new_mask_embedding is None:
+            # Extract features if needed
+            if self.spatial_features is None:
+                self.spatial_features = self._extract_features(image)
+            
+            # Compute mask embedding
+            new_mask_embedding = self._compute_mask_embedding(self.spatial_features, mask)
+            
         if new_mask_embedding is None:
             return []
         
@@ -263,10 +289,25 @@ class LabelPredictor:
             print(f"Error comparing with last mask: {e}")
             return None
 
-    def should_auto_assign(self, image: np.ndarray, mask: np.ndarray) -> Tuple[bool, Optional[str]]:
-        """Determine if a label should be automatically assigned."""
-        # Get predictions
-        predictions = self.predict_label(image, mask, top_k=len(self.prototypes), force_prediction=True)
+    def should_auto_assign(self, image: np.ndarray, mask: np.ndarray, threshold=None, mask_embedding=None) -> Tuple[bool, Optional[str]]:
+        """Determine if a label should be automatically assigned.
+        
+        Args:
+            image: Source image
+            mask: Binary mask of the object
+            threshold: Optional custom threshold (uses self.confidence_threshold if None)
+            mask_embedding: Optional pre-computed embedding to avoid recomputation
+            
+        Returns:
+            (bool, str): Tuple of (should_auto_assign, predicted_label)
+        """
+        # Use provided threshold or fallback to default
+        if threshold is None:
+            threshold = self.confidence_threshold
+            
+        # Get predictions with the pre-computed embedding if available
+        predictions = self.predict_label(image, mask, top_k=len(self.prototypes), 
+                                        force_prediction=True, embedding=mask_embedding)
         if not predictions:
             return False, None
         
@@ -317,11 +358,11 @@ class LabelPredictor:
                 print("Different from previous mask")
         
         # Auto assign?
-        print(f"\nThreshold: {self.confidence_threshold:.4f}")
-        print(f"Auto-assign: {'Yes' if top_similarity >= self.confidence_threshold else 'No'}")
+        print(f"\nThreshold: {threshold:.4f}")
+        print(f"Auto-assign: {'Yes' if top_similarity >= threshold else 'No'}")
         print("=======================================")
         
-        return top_similarity >= self.confidence_threshold, top_label
+        return top_similarity >= threshold, top_label
 
     def print_database_status(self, detailed: bool = False) -> None:
         """Print database status."""
@@ -841,3 +882,35 @@ class LabelPredictor:
             ))
             
         return triplets
+    
+    def remove_example(self, mask, label):
+        """
+        Remove an example from the feature database.
+        
+        Args:
+            mask: Binary mask representing the object to remove
+            label: Label of the example to remove
+        """
+        if label not in self.feature_database:
+            print(f"Warning: No examples found for label '{label}'")
+            return
+        
+        # We can't identify the exact mask since we only store embeddings
+        # For simplicity, we'll remove the last example of the given label
+        if self.feature_database[label]:
+            # Remove the last embedding for this label
+            self.feature_database[label].pop()
+            print(f"Removed last example with label '{label}'")
+            
+            # Update or remove the prototype based on remaining examples
+            if self.feature_database[label]:
+                # Update prototype with remaining examples
+                self.prototypes[label] = np.mean([e for e in self.feature_database[label]], axis=0)
+                print(f"Updated prototype for label '{label}' with {len(self.feature_database[label])} remaining examples")
+            else:
+                # If no examples left, remove the prototype
+                if label in self.prototypes:
+                    del self.prototypes[label]
+                    print(f"Removed prototype for label '{label}' (no examples left)")
+        else:
+            print(f"No examples found for label '{label}'")
