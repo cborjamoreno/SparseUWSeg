@@ -1,9 +1,13 @@
-import itertools
 import sys
 import os
 import cv2
 import numpy as np
 import time
+import tempfile
+import torch
+import traceback
+import warnings
+
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QFileDialog, QVBoxLayout,
     QHBoxLayout, QMessageBox, QDialog, QProgressBar, QLineEdit, QListWidget,
@@ -11,15 +15,34 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QPixmap, QImage, QColor
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from sklearn.metrics.pairwise import cosine_similarity
-import torch
-import torch.nn.functional as F
-import math
 
-from segmenter_scop import Segmenter
-from label_predictor import LabelPredictor
+from segmenter_sam2 import Segmenter
+from point_selection_strategies import ToolSelectionStrategy
+from plas.segmenter_plas import SuperpixelLabelExpander
+from app_modules import LabelDialog, OverlapDialog
 
-from label_dialog import LabelDialog
+# Reduce noisy external warnings (safe to ignore)
+# SIP/PyQt deprecation noise
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=r".*sipPyTypeDict\(\).*")
+
+# SAM2 optional extension warning (post-processing fallback)
+warnings.filterwarnings("ignore", category=UserWarning, message=r".*cannot import name '_C' from 'sam2'.*")
+
+# PyTorch SDPA backend: avoid flash/mem-efficient attempts and related warnings
+try:
+    if hasattr(torch.backends, "cuda"):
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+except Exception:
+    pass
+
+# Silence specific SDPA kernel selection chatter
+warnings.filterwarnings("ignore", category=UserWarning, message=r".*Flash attention kernel not used.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=r".*Memory Efficient attention has been runtime disabled.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=r".*Memory efficient kernel not used because.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=r".*CuDNN attention kernel not used.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=r".*Expected query, key and value to all be of dtype.*scaled_dot_product_attention.*")
 
 def load_stylesheet(file_path):
     """Load stylesheet from a file"""
@@ -33,6 +56,7 @@ def load_stylesheet(file_path):
 # Subclass QLabel to capture mouse clicks on the image
 class ClickableLabel(QLabel):
     clicked = pyqtSignal(object)
+    right_clicked = pyqtSignal(object)  # New signal for right-click
     mouse_moved = pyqtSignal(object)  # New signal for mouse move
 
     def __init__(self, parent=None):
@@ -41,8 +65,11 @@ class ClickableLabel(QLabel):
         self.interactions_enabled = False
 
     def mousePressEvent(self, event):
-        if self.interactions_enabled and event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(event.pos())
+        if self.interactions_enabled:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.clicked.emit(event.pos())
+            elif event.button() == Qt.MouseButton.RightButton:
+                self.right_clicked.emit(event.pos())
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -50,25 +77,29 @@ class ClickableLabel(QLabel):
             self.mouse_moved.emit(event.pos())
         super().mouseMoveEvent(event)
 
-# Thread to generate the initial proposed point using an existing segmenter
-# Update the MaskingThread to pass the necessary parameters
-class MaskingThread(QThread):
+# Thread to suggest the next point using the adaptive interactive selection strategy
+class PointSuggestionThread(QThread):
     result_ready = pyqtSignal(tuple)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, segmenter, label_predictor=None, expanded_masks=None, parent=None):
-        super(MaskingThread, self).__init__(parent)
+    def __init__(self, strategy, segmenter, image, expanded_masks=None, last_mask=None, last_feature=None, actual_last_point=None, parent=None):
+        super().__init__(parent)
+        self.strategy = strategy
         self.segmenter = segmenter
-        self.label_predictor = label_predictor
-        self.expanded_masks = expanded_masks
+        self.image = image
+        self.expanded_masks = expanded_masks or []
+        self.last_mask = last_mask
+        self.last_feature = last_feature
+        self.actual_last_point = actual_last_point
 
     def run(self):
         try:
-            best_point = self.segmenter.get_best_point(
-                label_predictor=self.label_predictor,
-                expanded_masks=self.expanded_masks
+            # Using ToolSelectionStrategy: pass only supported args
+            next_point = self.strategy.get_next_point(
+                last_mask=self.last_mask,
+                actual_last_point=self.actual_last_point
             )
-            self.result_ready.emit(best_point)
+            self.result_ready.emit(next_point)
         except Exception as e:
             self.error_occurred.emit(str(e))
             import traceback
@@ -101,10 +132,11 @@ class ImageViewer(QWidget):
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setFixedSize(1000, 700)
         self.image_label.clicked.connect(self.on_image_clicked)
+        self.image_label.right_clicked.connect(self.on_image_right_clicked)
         self.image_label.interactions_enabled = False
 
         # Buttons
-        stylesheet = load_stylesheet("button_styles.qss")
+        stylesheet = load_stylesheet("app_modules/button_styles.qss")
         app.setStyleSheet(stylesheet)
 
         self.select_button = QPushButton("Select Folder", self)
@@ -202,10 +234,11 @@ class ImageViewer(QWidget):
         self.overlay_image = None
         self.displayed_pixmap = None
         self.segmenter = None
+        self.plas_segmenter = None  # Initialize PLAS segmenter
         self.labels = {}
         self.expanded_masks = []
         self.combined_mask_overlay = None
-
+        
         self.image_label.mouse_moved.connect(self.on_mouse_moved)
 
         # New variables for multiple points
@@ -228,14 +261,15 @@ class ImageViewer(QWidget):
         self.current_mask_area = 0
         self.total_image_area = 0
         self.coverage_ratio = 0
-        self.label_predictor = LabelPredictor(confidence_threshold=0.85, min_examples_per_class=5)
+        self.last_actual_click = None  # Track the user's actual last click
 
         self.current_mode = "creation"  # or "selection"
         self.is_over_mask = False
         self.current_mask_index = None
         self.masks_visible = True
-        self.automatic_masks = None  # Will store SAM's automatic masks
-        self.auto_label_threshold = 0.75  # Similarity threshold for auto-labeling
+        
+        # Initialize the point selection strategy
+        self.point_strategy = None
 
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder with Images")
@@ -247,11 +281,38 @@ class ImageViewer(QWidget):
             ]
             self.image_list.sort()
             self.current_index = 0
+            
+            # Reset all labeling-related state when selecting a new folder
             self.segmenter = None  # Reset segmenter for a new folder
+            self.plas_segmenter = None  # Reset PLAS segmenter
+            self.point_strategy = None  # Reset point strategy
+            self.expanded_masks = []
+            self.combined_mask_overlay = None
+            self.suggested_point = None
+            
+            # Reset points and labeling state
+            self.positive_points = []
+            self.negative_points = []
+            self.is_selecting_points = False
+            self.last_actual_click = None  # Reset tracking
+            
+            # Reset UI to initial state
+            self.image_label.interactions_enabled = False
+            self.switch_button.hide()
+            self.finish_button.hide()
+            self.toggle_masks_button.hide()
+            self.toggle_masks_button.setEnabled(False)
+            self.start_button.setEnabled(True)
 
             if self.image_list:
+                # Load and display the first image of the new folder
+                current_image_path = self.image_list[self.current_index]
+                image = cv2.imread(current_image_path)
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                self.current_image = image
                 self.show_image()
-                self.start_button.setEnabled(True)
+                
+                # Enable navigation buttons
                 self.next_button.setEnabled(True)
                 self.prev_button.setEnabled(True)
 
@@ -290,9 +351,25 @@ class ImageViewer(QWidget):
         QTimer.singleShot(100, lambda: self.initialize_segmenter_and_start_thread(wait_dialog))
         wait_dialog.exec()
 
+
+    import sys
+
+    def print_memory_usage(self):
+        """Print the memory usage of key objects in GB."""
+        expanded_masks_size = sys.getsizeof(self.expanded_masks)
+        combined_mask_overlay_size = sys.getsizeof(self.combined_mask_overlay) if self.combined_mask_overlay is not None else 0
+
+        # Convert sizes to MB
+        expanded_masks_mb = expanded_masks_size / (1024 ** 2)
+        combined_mask_overlay_mb = combined_mask_overlay_size / (1024 ** 2)
+
+        print(f"Memory Usage:")
+        print(f"  - expanded_masks: {expanded_masks_mb:.4f} MB")
+        print(f"  - combined_mask_overlay: {combined_mask_overlay_mb:.4f} MB")
+
     def initialize_segmenter_and_start_thread(self, wait_dialog):
         sam2_checkpoint = "checkpoints/sam2.1_hiera_large.pt"
-        sam_checkpoint = "checkpoints/vit_b_coralscop.pth"
+        # sam_checkpoint = "checkpoints/vit_b_coralscop.pth"
         sam2_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
         current_image_path = self.image_list[self.current_index]
 
@@ -301,135 +378,89 @@ class ImageViewer(QWidget):
         self.current_image = image
 
         if self.segmenter is None:
-            self.segmenter = Segmenter(self.current_image, sam_checkpoint, sam2_checkpoint, sam2_cfg)
+            # Segmenter(image=None, sam2_checkpoint_path=None, sam2_config_path=None, device='cuda')
+            # The second arg in app previously pointed to a SAM1 checkpoint; Segmenter expects SAM2 checkpoint and config.
+            # Pass correct positions: (image=None, sam2_checkpoint_path, sam2_config_path, device)
+            self.segmenter = Segmenter(
+                image=None,
+                sam2_checkpoint_path=sam2_checkpoint,
+                sam2_config_path=sam2_cfg,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+            )
+            # Generate masks for the current image
+            self.segmenter.set_image(self.current_image)
             
-            # Get automatic mask candidates when segmenter is initialized
-            wait_dialog.setWindowTitle("Generating Proposed Point")
+            # Initialize PLAS segmenter for superpixel-based expansion
+            self.plas_segmenter = SuperpixelLabelExpander("cuda" if torch.cuda.is_available() else "cpu")
+            
+            # Initialize the point selection strategy
+            wait_dialog.setWindowTitle("Initializing Point Selection Strategy")
             wait_layout = wait_dialog.layout()
-            wait_layout.itemAt(0).widget().setText("Analyzing image for potential objects...")
+            wait_layout.itemAt(0).widget().setText("Setting up interactive point selection...")
             QApplication.processEvents()
             
-            # Get automatic masks from SAM
-            self.automatic_masks = self.segmenter.masks
-            print(f"Found {len(self.automatic_masks)} potential objects")
+            # Get generated masks and features for the strategy
+            generated_masks = self.segmenter.masks
+            print(f"Found {len(generated_masks)} potential objects")
             
-            # Pre-filter masks by size to reduce processing
-            filtered_masks = []
-            for mask_data in self.automatic_masks:
+            # Extract features for all masks
+            features = []
+            for mask_data in generated_masks:
+                # Use a simple approach for features - could be improved
                 mask = mask_data['segmentation']
-                mask_area = np.sum(mask)
-                if 100 <= mask_area <= (self.current_image.shape[0] * self.current_image.shape[1] * 0.8):
-                    filtered_masks.append(mask_data)
+                # Simple feature: area and position
+                area = np.sum(mask)
+                if area > 0:
+                    y_indices, x_indices = np.where(mask)
+                    centroid_y = np.mean(y_indices)
+                    centroid_x = np.mean(x_indices)
+                    # Create a simple feature vector
+                    feature = np.array([area, centroid_y, centroid_x, mask_data.get('predicted_iou', 0.5)])
+                    features.append(feature)
+                else:
+                    features.append(np.zeros(4))
             
-            self.automatic_masks = filtered_masks
-            print(f"Filtered to {len(self.automatic_masks)} valid objects by size")
+            features = np.array(features)
             
-            # Check if we have any prototypes for auto-labeling
-            has_prototypes = hasattr(self.label_predictor, 'prototypes') and self.label_predictor.prototypes
+            # Initialize the strategy
+            self.point_strategy = ToolSelectionStrategy()
+            # Setup expects only (image, generated_masks)
+            self.point_strategy.setup_simple(self.current_image, generated_masks)
             
-            if has_prototypes:
-                wait_layout.itemAt(0).widget().setText("Auto-labeling objects with existing classes...")
-                QApplication.processEvents()
-                
-                # Process in batches
-                batch_size = 10
-                auto_labeled_count = 0
-                newly_labeled_masks = []
-                
-                for i in range(0, len(self.automatic_masks), batch_size):
-                    batch = self.automatic_masks[i:i+batch_size]
-                    wait_layout.itemAt(0).widget().setText(f"Processing objects {i+1}-{min(i+batch_size, len(self.automatic_masks))} of {len(self.automatic_masks)}...")
-                    QApplication.processEvents()
-                    
-                    # Process each mask in the batch
-                    for mask_data in batch:
-                        try:
-                            mask = mask_data['segmentation']
-                            
-                            # Skip if this mask overlaps with existing masks
-                            if self.is_mask_overlapping(mask):
-                                continue
-                            
-                            # Extract features for this mask
-                            features = self.label_predictor._extract_features(self.current_image, mask)
-                            embedding = self.label_predictor._compute_mask_embedding(features, mask)
-                            
-                            if embedding is None:
-                                continue
-                            
-                            # Check if we should auto-assign a label
-                            should_auto, predicted_label = self.label_predictor.should_auto_assign(
-                                self.current_image, 
-                                mask,
-                                mask_embedding=embedding,  # Pass embedding to avoid recomputing
-                                threshold=self.auto_label_threshold
-                            )
-                            
-                            if should_auto and predicted_label in self.labels:
-                                # Auto-assign the label
-                                color = self.labels[predicted_label]
-                                
-                                # Add to expanded masks (but don't update visuals yet)
-                                self.expanded_masks.append((mask, predicted_label, color))
-                                
-                                # Track for removal from automatic_masks
-                                newly_labeled_masks.append(mask)
-                                auto_labeled_count += 1
-                                
-                                # Add to the training data
-                                self.label_predictor.add_example(self.current_image, mask, predicted_label, features=features)
-                                
-                                print(f"Auto-labeled object as '{predicted_label}' (at startup)")
-                        except Exception as e:
-                            print(f"Error processing mask: {e}")
-                    
-                    # Force GC after each batch
-                    import gc
-                    gc.collect()
-                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                
-                # Now update the visual overlay once for all new masks
-                if auto_labeled_count > 0:
-                    # Update combined mask overlay
-                    self.regenerate_combined_mask_overlay()
-                    
-                    # Enable masks button if we have masks now
-                    self.toggle_masks_button.setEnabled(True)
-                    
-                    print(f"✓ Auto-labeled {auto_labeled_count} objects at startup")
-                    
-                    # Add this section: Mark auto-labeled masks as selected in the segmenter
-                    if hasattr(self, 'segmenter') and hasattr(self.segmenter, 'point_selector'):
-                        for mask_data in self.automatic_masks:
-                            if any(np.array_equal(mask_data['segmentation'], mask) for mask in newly_labeled_masks):
-                                # Mark this mask as selected so it won't be suggested again
-                                self.segmenter.selected_masks.add(id(mask_data))
-                                # Also add its centroid to selected points
-                                segmentation = mask_data['segmentation']
-                                indices = list(zip(*segmentation.nonzero()))
-                                if indices:
-                                    centroid = np.mean(indices, axis=0)
-                                    self.segmenter.selected_points.append(np.array(centroid.astype(int)))
-                    
-                    # Remove the auto-labeled masks from future consideration
-                    self.automatic_masks = [m for m in self.automatic_masks 
-                                           if not any(np.array_equal(m['segmentation'], mask) for mask in newly_labeled_masks)]
-
-        self.masking_thread = MaskingThread(
+            # Store generated masks in the strategy for the random phase
+            self.point_strategy.generated_masks = generated_masks
+            
+        # Get the first suggested point
+        self.point_thread = PointSuggestionThread(
+            self.point_strategy, 
             self.segmenter, 
-            label_predictor=self.label_predictor,
-            expanded_masks=self.expanded_masks
+            self.current_image,
+            expanded_masks=self.expanded_masks,
+            last_mask=None,
+            last_feature=None,
+            actual_last_point=None
         )
-        self.masking_thread.result_ready.connect(lambda best_point: self.on_masking_complete(best_point, wait_dialog))
-        self.masking_thread.start()
+        self.point_thread.result_ready.connect(lambda next_point: self.on_point_suggestion_complete(next_point, wait_dialog))
+        self.point_thread.error_occurred.connect(lambda error: self.on_point_suggestion_error(error, wait_dialog))
+        self.point_thread.start()
 
-    def on_masking_complete(self, best_point, wait_dialog):
+    def on_point_suggestion_complete(self, next_point, wait_dialog):
         wait_dialog.accept()
-        if (best_point):
-            print(f"Proposed point: {best_point}")
-            self.suggested_point = best_point
+        if next_point:
+            self.suggested_point = next_point
         else:
             print("No valid point proposed.")
+            self.suggested_point = None
+        self.show_image(overlay_point=self.suggested_point)
+    
+    def on_point_suggestion_error(self, error_msg, wait_dialog):
+        wait_dialog.accept()
+        print(f"Error in point suggestion: {error_msg}")
+        # Fall back to center of image
+        if hasattr(self, 'current_image') and self.current_image is not None:
+            h, w = self.current_image.shape[:2]
+            self.suggested_point = (h // 2, w // 2)
+        else:
             self.suggested_point = None
         self.show_image(overlay_point=self.suggested_point)
 
@@ -455,24 +486,40 @@ class ImageViewer(QWidget):
                     self.show_mask_context_menu(pos, mask_index)
                     return
             elif self.current_mode == "creation":
-                # We're in creation mode - first check if we're over a mask
+                # In creation mode, always allow point placement
+                # Check if we're clicking over an existing mask for potential merging
                 mask_index = self.get_mask_at_position(current_point)
-                if mask_index is not None and self.is_over_mask:
-                    # Show context menu for the selected mask
-                    self.current_mask_index = mask_index
-                    self.show_mask_context_menu(pos, mask_index)
+                
+                # Add the point first
+                if self.current_point_type == "positive":
+                    self.positive_points.append(current_point)
+                    print(f"Positive point added at: {current_point}")
+                    self.finish_button.setEnabled(True)
+                    self.switch_button.setEnabled(True)
+                    # Track actual user click for adaptive strategy
+                    self.last_actual_click = current_point
+                else:
+                    self.negative_points.append(current_point)
+                    print(f"Negative point added at: {current_point}")
+                    # Track actual user click for adaptive strategy
+                    self.last_actual_click = current_point
+                
+                # Check if this click overlaps with existing masks (for positive points only)
+                overlap_info = None
+                if self.current_point_type == "positive":
+                    # Check if the clicked point overlaps with any existing mask
+                    overlap_info = self.check_point_overlap(current_point)
+                
+                # Check if we need to handle overlap
+                if overlap_info:
+                    # Remove the point we just added since we'll handle it through overlap dialog
+                    if self.current_point_type == "positive":
+                        self.positive_points.pop()
+                    else:
+                        self.negative_points.pop()
+                    self.handle_point_overlap(current_point, overlap_info)
                 else:
                     # Normal point placement behavior
-                    if self.current_point_type == "positive":
-                        self.positive_points.append(current_point)
-                        print(f"Positive point added at: {current_point}")
-                        self.finish_button.setEnabled(True)
-                        self.switch_button.setEnabled(True)
-                    else:
-                        self.negative_points.append(current_point)
-                        print(f"Negative point added at: {current_point}")
-                    
-                    # Update preview with the new point
                     self.update_preview_with_points()
         else:
             # Fallback if mode is not set
@@ -481,19 +528,42 @@ class ImageViewer(QWidget):
                 print(f"Positive point added at: {current_point}")
                 self.finish_button.setEnabled(True)
                 self.switch_button.setEnabled(True)
+                # Track actual user click for adaptive strategy
+                self.last_actual_click = current_point
             else:
                 self.negative_points.append(current_point)
                 print(f"Negative point added at: {current_point}")
+                # Track actual user click for adaptive strategy
+                self.last_actual_click = current_point
             
             # Update preview with the new point
             self.update_preview_with_points()
+
+    def on_image_right_clicked(self, pos):
+        """Handle right-click on image - show context menu for masks"""
+        if self.current_image is None or self.displayed_pixmap is None:
+            return
+
+        # Convert click position to image coordinates
+        current_point = self.get_image_coordinates(pos)
+        if current_point is None:
+            return
+        
+        # Only show context menu in creation mode and if we're over a mask
+        if (hasattr(self, 'current_mode') and self.current_mode == "creation" and 
+            self.masks_visible):
+            mask_index = self.get_mask_at_position(current_point)
+            if mask_index is not None:
+                # Show context menu for the selected mask
+                self.current_mask_index = mask_index
+                self.show_mask_context_menu(pos, mask_index)
 
     def update_preview_with_points(self):
         """Update display with current points and preview mask"""
         # Start with original image and add cached overlay if masks are visible
         overlay_image = self.current_image.copy()
         if self.masks_visible and self.combined_mask_overlay is not None:
-            overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.6, 0)
+            overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.8, 0)
 
         # Draw all current points
         for point in self.positive_points:
@@ -512,7 +582,7 @@ class ImageViewer(QWidget):
                 colored_preview[preview_mask > 0] = (128, 128, 128)  # Gray for preview
                 overlay_image = cv2.addWeighted(overlay_image, 1.0, colored_preview, 0.4, 0)
 
-        # Add suggested point if it exists
+        # Show suggested point cross when updating preview with points
         if hasattr(self, 'suggested_point') and self.suggested_point:
             row, col = self.suggested_point
             cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
@@ -521,7 +591,7 @@ class ImageViewer(QWidget):
         self.update_display(overlay_image)
 
     def delete_mask(self, mask_index):
-        """Delete a mask, remove from database, and update the contrastive model"""
+        """Delete a mask and update the display"""
         if not (0 <= mask_index < len(self.expanded_masks)):
             return
             
@@ -539,30 +609,6 @@ class ImageViewer(QWidget):
         self.is_over_mask = False
         self.setCursor(Qt.CursorShape.ArrowCursor)
         
-        # IMPORTANT: Update the contrastive learning model
-        if hasattr(self, 'label_predictor'):
-            print(f"\n===== UPDATING CONTRASTIVE MODEL =====")
-            print(f"Removing deleted mask with label '{label}'")
-            
-            # Remove the example from the database
-            self.label_predictor.remove_example(mask, label)
-            
-            # Retrain the contrastive model if needed
-            class_counts = {label: len(examples) for label, examples in 
-                           self.label_predictor.feature_database.items()}
-            
-            # Check if we have enough data to perform contrastive training
-            classes_with_examples = sum(1 for count in class_counts.values() if count > 0)
-            
-            if classes_with_examples >= 2:
-                print("Retraining contrastive model...")
-                self.label_predictor.train_contrastive_optimized(epochs=10, margin=0.5)
-                print(f"✓ Contrastive model retrained successfully")
-            else:
-                print(f"Not enough classes ({classes_with_examples}) for contrastive learning")
-            
-            print("========================================\n")
-        
         # Print informative message
         print(f"Deleted mask with label '{label}'")
         
@@ -570,7 +616,7 @@ class ImageViewer(QWidget):
         self.update_display_with_current_state()
 
     def change_mask_label(self, mask_index):
-        """Change the label of a mask and update the contrastive learning model"""
+        """Change the label of a mask"""
         if not (0 <= mask_index < len(self.expanded_masks)):
             return
             
@@ -595,37 +641,6 @@ class ImageViewer(QWidget):
                 self.regenerate_combined_mask_overlay()
                 
                 print(f"Changed mask label from '{old_label}' to '{new_label}'")
-                
-                # IMPORTANT: Update the contrastive learning model
-                if hasattr(self, 'label_predictor'):
-                    print(f"\n===== UPDATING CONTRASTIVE MODEL =====")
-                    print(f"Removing example with label '{old_label}'")
-                    print(f"Adding example with new label '{new_label}'")
-                    
-                    # Extract features for this mask
-                    features = self.label_predictor._extract_features(self.current_image, mask)
-                    
-                    # Remove the old example
-                    self.label_predictor.remove_example(mask, old_label)
-                    
-                    # Add the new example
-                    self.label_predictor.add_example(self.current_image, mask, new_label, features=features)
-                    
-                    # Retrain the contrastive model
-                    class_counts = {label: len(examples) for label, examples in 
-                                   self.label_predictor.feature_database.items()}
-                    
-                    # Check if we have enough data to perform contrastive training
-                    classes_with_examples = sum(1 for count in class_counts.values() if count > 0)
-                    
-                    if classes_with_examples >= 2:
-                        print("Retraining contrastive model...")
-                        self.label_predictor.train_contrastive_optimized(epochs=10, margin=0.5)
-                        print(f"✓ Contrastive model retrained successfully")
-                    else:
-                        print(f"Not enough classes ({classes_with_examples}) for contrastive learning")
-                    
-                    print("========================================\n")
                 
                 # Update the display
                 self.update_display_with_current_state()
@@ -678,105 +693,6 @@ class ImageViewer(QWidget):
             self.finish_button.setEnabled(True)  # Re-enable the finish button
             return
 
-        # Print detailed database status at the beginning
-        self.label_predictor.print_database_status()
-            
-        # Get predictions for current mask BEFORE showing dialog (to show initial predictions)
-        if hasattr(self, 'label_predictor'):
-            print("\n===== INITIAL MASK PREDICTION =====")
-            
-            if not self.labels:
-                print("No labels defined yet. This will be the first mask.")
-            elif not hasattr(self.label_predictor, 'feature_database') or len(self.label_predictor.feature_database) == 0:
-                print("Feature database is empty. No predictions possible.")
-            else:
-                # Get predictions for current mask (even if we don't have enough examples)
-                try:
-                    # Try to get raw similarities for all classes
-                    features = self.label_predictor._extract_features(self.current_image, mask)
-                    
-                    print(f"Available labels: {list(self.labels.keys())}")
-                    print(f"Current min examples threshold: {self.label_predictor.min_examples_per_class}")
-                    
-                    # Get predictions with all available classes
-                    all_predictions = []
-                    
-                    # Try to compute similarities even if below min_examples threshold
-                    if hasattr(self.label_predictor, 'prototypes') and self.label_predictor.prototypes:
-                        for label, prototype in self.label_predictor.prototypes.items():
-                            current_count = len(self.label_predictor.feature_database.get(label, []))
-                            try:
-                                # Extract spatial features from the image
-                                spatial_features = self.label_predictor._extract_features(self.current_image, mask)
-                                
-                                # Calculate mask embedding (average of features inside the mask)
-                                mask_embedding = self.label_predictor._compute_mask_embedding(spatial_features, mask)
-                                
-                                if mask_embedding is None:
-                                    print(f"Could not calculate embedding for '{label}': Empty mask")
-                                    continue
-                                    
-                                # Convert to torch tensors with correct dimensions
-                                feat_tensor = torch.tensor(mask_embedding, dtype=torch.float32)
-                                proto_tensor = torch.tensor(prototype, dtype=torch.float32)
-
-                                # Check for problematic values before normalization
-                                if torch.isnan(feat_tensor).any() or torch.isinf(feat_tensor).any():
-                                    print(f"Warning: NaN or Inf in feature tensor before normalization")
-                                    # Replace problematic values with zeros
-                                    feat_tensor = torch.nan_to_num(feat_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
-
-                                if torch.isnan(proto_tensor).any() or torch.isinf(proto_tensor).any():
-                                    print(f"Warning: NaN or Inf in prototype tensor before normalization")
-                                    # Replace problematic values with zeros
-                                    proto_tensor = torch.nan_to_num(proto_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
-
-                                # Then normalize with epsilon for numerical stability
-                                feat_norm = F.normalize(feat_tensor, dim=0, eps=1e-8)
-                                proto_norm = F.normalize(proto_tensor, dim=0, eps=1e-8)
-
-                                # Safe dot product with error handling
-                                try:
-                                    similarity = torch.dot(feat_norm, proto_norm).item()
-                                    if math.isnan(similarity) or math.isinf(similarity):
-                                        print(f"Warning: Similarity calculation produced NaN or Inf, defaulting to 0.0")
-                                        similarity = 0.0
-                                except Exception as e:
-                                    print(f"Error in similarity calculation: {e}")
-                                    similarity = 0.0
-
-                                all_predictions.append((label, similarity, current_count))
-                            except Exception as e:
-                                print(f"Could not calculate similarity for '{label}': {e}")
-                                
-                        # Sort by similarity
-                        all_predictions.sort(key=lambda x: x[1], reverse=True)
-                        
-                        if all_predictions:
-                            print("Raw similarity scores (before applying threshold):")
-                            for label, similarity, current_count in all_predictions:
-                                sufficient = "✓" if current_count >= self.label_predictor.min_examples_per_class else "✗"
-                                print(f"  - '{label}': {similarity:.4f} ({similarity*100:.1f}%) [Examples: {current_count} {sufficient}]")
-                    
-                    # Now get the official predictions that pass the threshold
-                    predictions = self.label_predictor.predict_label(self.current_image, mask)
-                    if predictions:
-                        print("\nOfficial predictions (after applying threshold):")
-                        for label, prob in predictions:
-                            print(f"  - '{label}': {prob:.4f} ({prob*100:.1f}%)")
-                        
-                        # Check if auto-assignment would happen
-                        should_auto, auto_label = self.label_predictor.should_auto_assign(self.current_image, mask)
-                        print(f"\nWould auto-assign: {should_auto}, Label: '{auto_label}'")
-                        print(f"Confidence threshold: {self.label_predictor.confidence_threshold}")
-                    else:
-                        print("No official predictions available - insufficient examples per class")
-                    
-                except Exception as e:
-                    print(f"Error getting predictions: {e}")
-                
-            print("==================================\n")
-
         dialog = LabelDialog(self.labels, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             label = dialog.selected_label
@@ -809,25 +725,7 @@ class ImageViewer(QWidget):
                 self.combined_mask_overlay[mask > 0] = colored_mask[mask > 0]
                 
                 # Update display with the new combined overlay and suggested point
-                overlay_image = cv2.addWeighted(self.current_image, 1.0, self.combined_mask_overlay, 0.6, 0)
-                
-                # Update point selector with the selected points and mask
-                if hasattr(self, 'segmenter') and hasattr(self.segmenter, 'point_selector'):
-                    # Find the mask ID that contains our first positive point
-                    for mask_obj in self.segmenter.masks:
-                        if mask_obj['segmentation'][stored_positive_points[0][0], stored_positive_points[0][1]]:
-                            self.segmenter.point_selector.update_selection_state(
-                                stored_positive_points[0], 
-                                id(mask_obj)
-                            )
-                            break
-                
-                # Get new candidate points with updated state
-                if hasattr(self, 'segmenter'):
-                    self.suggested_point = self.segmenter.get_best_point(
-                        label_predictor=self.label_predictor,
-                        expanded_masks=self.expanded_masks
-                    )
+                overlay_image = cv2.addWeighted(self.current_image, 1.0, self.combined_mask_overlay, 0.8, 0)
                 
                 self.update_display(overlay_image)
                 
@@ -836,73 +734,8 @@ class ImageViewer(QWidget):
                 self.total_image_area = self.current_image.shape[0] * self.current_image.shape[1]
                 self.coverage_ratio = self.current_mask_area / self.total_image_area
                 
-                # DEBUG: Print feature extraction progress
-                print(f"\nAdding example for label '{label}'...")
-                try:
-                    # Train predictor with the new example
-                    self.label_predictor.add_example(self.current_image, mask, label)
-                    print(f"✓ Successfully added example for label: {label}")
-                    
-                    # Show detailed database status after adding
-                    self.label_predictor.print_database_status(detailed=True)
-                    
-                    # Train embeddings using contrastive learning if we have enough examples
-                    class_counts = {label: len(examples) for label, examples in 
-                                   self.label_predictor.feature_database.items()}
-                    
-                    # Check if we have enough data to perform contrastive training
-                    # We need at least 2 classes with examples
-                    classes_with_examples = sum(1 for count in class_counts.values() if count > 0)
-                    
-                    if classes_with_examples >= 2:
-                        print("\n===== TRAINING EMBEDDINGS WITH CONTRASTIVE LEARNING =====")
-                        print(f"Classes with examples: {classes_with_examples}")
-                        
-                        # List all classes and their example counts
-                        print("Label Distribution:")
-                        for label, count in class_counts.items():
-                            print(f"  - '{label}': {count} examples")
-                        
-                        # Use more epochs for significant updates
-                        self.label_predictor.train_contrastive_optimized(epochs=20, margin=0.5)
-                        
-                        # Show similarities between classes after training
-                        print("\n===== POST-TRAINING SIMILARITY ANALYSIS =====")
-                        for label1, label2 in itertools.combinations(self.label_predictor.prototypes.keys(), 2):
-                            if label1 in self.label_predictor.prototypes and label2 in self.label_predictor.prototypes:
-                                proto1 = self.label_predictor.prototypes[label1]
-                                proto2 = self.label_predictor.prototypes[label2]
-                                
-                                # Calculate similarity between prototypes
-                                similarity = cosine_similarity(
-                                    np.array(proto1).reshape(1, -1),
-                                    np.array(proto2).reshape(1, -1)
-                                )[0][0]
-                                
-                                print(f"Similarity between '{label1}' and '{label2}': {similarity:.4f}")
-                        
-                        print("===== CONTRASTIVE TRAINING COMPLETE =====\n")
-                    else:
-                        print("\nNot enough classes for contrastive learning yet.")
-                        print(f"Need at least 2 classes with examples (current: {classes_with_examples})")
-                    
-                    # Show updated predictions
-                    print("\n===== UPDATED PREDICTIONS =====")
-                    predictions = self.label_predictor.predict_label(self.current_image, mask)
-                    
-                    if predictions:
-                        for label, prob in predictions:
-                            print(f"  - '{label}': {prob:.4f} ({prob*100:.1f}%)")
-                    else:
-                        print("No predictions available - need more examples")
-                    print("===============================\n")
-                    
-                except Exception as e:
-                    print(f"✗ Failed to add example or train contrastive model: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
+                print(f"Added mask with label '{label}' - Coverage: {self.coverage_ratio:.2%}")
                 
-                # ...rest of existing code...
         # Reset expansion state regardless of dialog result
         self.is_expanding = False
         
@@ -915,132 +748,76 @@ class ImageViewer(QWidget):
         if self.current_point_type == "negative":
             self.switch_point_type()  # Reset to positive if it was negative
 
-        # Look for similar automatic masks to apply the same label
-        if self.automatic_masks and mask is not None and self.current_label:
-            auto_labeled_count = 0
-            newly_labeled_masks = []
-            
-            print(f"\nSearching for objects similar to '{self.current_label}'...")
-            
-            # Extract features for the newly created mask once
-            new_features = self.label_predictor._extract_features(self.current_image, mask)
-            new_embedding = self.label_predictor._compute_mask_embedding(new_features, mask)
-            
-            if new_embedding is not None:
-                # Use batch approach again for consistency
-                batch_size = 10
-                
-                for i in range(0, len(self.automatic_masks), batch_size):
-                    batch = self.automatic_masks[i:i+batch_size]
+        # Get next suggested point using the point selection strategy
+        if hasattr(self, 'point_strategy') and self.point_strategy is not None:
+            # Update the strategy with the last created mask
+            if mask is not None:
+                # Extract simple features for the created mask
+                area = np.sum(mask)
+                if area > 0:
+                    y_indices, x_indices = np.where(mask)
+                    centroid_y = np.mean(y_indices)
+                    centroid_x = np.mean(x_indices)
+                    # Create a simple feature vector
+                    last_feature = np.array([area, centroid_y, centroid_x, 0.5])
                     
-                    # Process each mask in the batch
-                    for mask_data in batch:
-                        try:
-                            candidate_mask = mask_data['segmentation']
-                            
-                            # Skip if this mask overlaps with existing masks
-                            if self.is_mask_overlapping(candidate_mask):
-                                continue
-                            
-                            # Use pre-computed embedding if available
-                            candidate_embedding = mask_data.get('embedding')
-                            
-                            # Re-compute only if necessary
-                            if candidate_embedding is None:
-                                # We need to extract features only for this specific mask
-                                candidate_features = self.label_predictor._extract_features(self.current_image, candidate_mask)
-                                candidate_embedding = self.label_predictor._compute_mask_embedding(candidate_features, candidate_mask)
-                                mask_data['embedding'] = candidate_embedding
-                            
-                            if candidate_embedding is None:
-                                continue
-                            
-                            # Calculate similarity using embeddings
-                            similarity = cosine_similarity(
-                                np.array(new_embedding).reshape(1, -1),
-                                np.array(candidate_embedding).reshape(1, -1)
-                            )[0][0]
-                            
-                            # If similar enough, auto-apply the label
-                            if similarity > self.auto_label_threshold:
-                                # Use the same color as the current label
-                                color = self.labels.get(self.current_label)
-                                
-                                # Add to expanded masks (without updating visuals yet)
-                                self.expanded_masks.append((candidate_mask, self.current_label, color))
-                                
-                                # Track for removal
-                                newly_labeled_masks.append(candidate_mask)
-                                auto_labeled_count += 1
-                                
-                                # Now we need to extract full features again for training
-                                # This is a necessary expense to maintain prediction quality
-                                candidate_features = self.label_predictor._extract_features(self.current_image, candidate_mask)
-                                self.label_predictor.add_example(self.current_image, candidate_mask, 
-                                                                 self.current_label, features=candidate_features)
-                                
-                                # Delete features immediately to save memory
-                                del candidate_features
-                                
-                                print(f"Auto-labeled object as '{self.current_label}' (similarity: {similarity:.3f})")
-                        
-                        except Exception as e:
-                            print(f"Error comparing masks: {e}")
+                    # Start a new thread to get the next suggested point
+                    # Convert user click from (x, y) to (y, x) format for the strategy
+                    actual_click_yx = None
+                    if self.last_actual_click:
+                        x, y = self.last_actual_click
+                        actual_click_yx = (y, x)  # Convert (x, y) to (y, x)
                     
-                    # Aggressively clean up after each batch
-                    import gc
-                    gc.collect()
-                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                    self.point_thread = PointSuggestionThread(
+                        self.point_strategy, 
+                        self.segmenter, 
+                        self.current_image,
+                        expanded_masks=self.expanded_masks,
+                        last_mask=mask,
+                        last_feature=last_feature,
+                        actual_last_point=actual_click_yx
+                    )
+                    self.point_thread.result_ready.connect(lambda next_point: self.on_next_point_ready(next_point))
+                    self.point_thread.error_occurred.connect(lambda error: self.on_next_point_error(error))
+                    self.point_thread.start()
                     
-                # Rest of the code for updating display
-                if auto_labeled_count > 0:
-                    # Generate the combined overlay
-                    self.regenerate_combined_mask_overlay()
-                    
-                    # Now update the display
-                    self.update_display_with_current_state()
-                    
-                    print(f"✓ Auto-labeled {auto_labeled_count} objects with the label '{self.current_label}'")
-                    
-                    # Add this section: Mark auto-labeled masks as selected in the segmenter
-                    if hasattr(self, 'segmenter') and hasattr(self.segmenter, 'point_selector'):
-                        for mask_data in self.automatic_masks:
-                            if any(np.array_equal(mask_data['segmentation'], mask) for mask in newly_labeled_masks):
-                                # Mark this mask as selected so it won't be suggested again
-                                self.segmenter.selected_masks.add(id(mask_data))
-                                # Also add its centroid to selected points
-                                segmentation = mask_data['segmentation']
-                                indices = list(zip(*segmentation.nonzero()))
-                                if indices:
-                                    centroid = np.mean(indices, axis=0)
-                                    self.segmenter.selected_points.append(np.array(centroid.astype(int)))
-                    
-                    # Remove the auto-labeled masks from future consideration
-                    self.automatic_masks = [m for m in self.automatic_masks 
-                                           if not any(np.array_equal(m['segmentation'], mask) for mask in newly_labeled_masks)]
-                    
-                    # Modified code to track auto-labeled masks more reliably
-                    for i, (candidate_mask, _, _) in enumerate(self.expanded_masks[-auto_labeled_count:]):
-                        # These are the newly added masks
-                        mask_id = id(candidate_mask)  # Get unique ID for this mask
-                        
-                        # Explicitly add to segmenter's tracking sets
-                        if hasattr(self, 'segmenter'):
-                            # Add mask ID to explicitly mark as processed
-                            self.segmenter.selected_masks.add(mask_id)
-                            
-                            # Find and store centroid
-                            indices = list(zip(*candidate_mask.nonzero()))
-                            if indices:
-                                centroid = np.mean(indices, axis=0)
-                                # Cast to int to avoid floating point issues
-                                centroid_point = np.array([int(centroid[0]), int(centroid[1])])
-                                self.segmenter.selected_points.append(centroid_point)
-                                print(f"Tracking mask {mask_id} with centroid: {centroid_point}")
-                        
-                        # Also track the mask in the rejection set for double safety
-                        if hasattr(self, 'segmenter') and hasattr(self.segmenter, 'rejected_masks'):
-                            self.segmenter.rejected_masks.add(mask_id)
+                    # Reset the actual click tracking after using it
+                    self.last_actual_click = None
+
+    def on_next_point_ready(self, next_point):
+        """Handle when the next suggested point is ready"""
+        if next_point:
+            self.suggested_point = next_point
+        else:
+            print("No valid next point proposed.")
+            self.suggested_point = None
+        # If the strategy stored an acquisition map, display it on the main thread for debugging
+        try:
+            if hasattr(self, 'point_strategy') and self.point_strategy is not None:
+                strat = self.point_strategy
+                A_map = getattr(strat, '_last_acquisition_map', None)
+                last_pt = getattr(strat, '_last_selected_point', None)
+                # if A_map is not None and hasattr(strat, 'display_acquisition_heatmap_main_thread'):
+                #     try:
+                #         strat.display_acquisition_heatmap_main_thread(A_map, next_point if next_point is not None else last_pt)
+                #     except Exception:
+                #         pass
+        except Exception:
+            pass
+
+        # Update the display with the new suggested point
+        self.update_display_with_current_state()
+
+    def on_next_point_error(self, error_msg):
+        """Handle errors when getting next point"""
+        print(f"Error getting next point: {error_msg}")
+        # Fall back to center of image or keep current point
+        if not hasattr(self, 'suggested_point') or self.suggested_point is None:
+            if hasattr(self, 'current_image') and self.current_image is not None:
+                h, w = self.current_image.shape[:2]
+                self.suggested_point = (h // 2, w // 2)
+            else:
+                self.suggested_point = None
 
     def toggle_masks_visibility(self):
         """Toggle the visibility of all masks"""
@@ -1080,6 +857,208 @@ class ImageViewer(QWidget):
         
         return None
 
+    def check_point_overlap(self, point):
+        """Check if a point overlaps with any existing mask and return mask info"""
+        if not self.expanded_masks:
+            return None
+            
+        x, y = point
+        
+        # Check each mask
+        for i, (mask, label, color) in enumerate(self.expanded_masks):
+            # Check if the point is within this mask
+            if 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1] and mask[y, x]:
+                return {
+                    'mask_index': i,
+                    'mask': mask,
+                    'label': label,
+                    'color': color
+                }
+        
+        return None
+
+    def handle_point_overlap(self, clicked_point, overlap_info):
+        """Handle when user clicks on a point that overlaps with existing masks"""
+        overlapping_mask = overlap_info['mask']
+        overlapping_label = overlap_info['label']
+        
+        # Show dialog to user
+        dialog = OverlapDialog(self.suggested_point, overlapping_label, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            if dialog.result_choice == "same_object":
+                self.handle_same_object_merge(clicked_point, overlap_info)
+            elif dialog.result_choice == "different_object":
+                self.handle_different_object_overlap(clicked_point, overlap_info)
+        # If canceled, do nothing
+    
+    def handle_same_object_merge(self, clicked_point, overlap_info):
+        """Handle when user says the point belongs to the same object - union masks"""
+        # Add the point and create mask as normal
+        self.positive_points.append(clicked_point)
+        self.last_actual_click = clicked_point
+        
+        # Generate the new mask
+        points = np.array(self.positive_points + self.negative_points)
+        labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points))
+        new_mask = self.segmenter.propagate_points(points, labels, update_expanded_mask=False)
+        
+        if new_mask is not None:
+            # Union with the existing mask
+            existing_mask = overlap_info['mask']
+            existing_label = overlap_info['label']
+            existing_color = overlap_info['color']
+            mask_index = overlap_info['mask_index']
+            
+            # Create union of masks
+            union_mask = np.logical_or(existing_mask, new_mask).astype(np.uint8)
+            
+            # Replace the existing mask with the union
+            self.expanded_masks[mask_index] = (union_mask, existing_label, existing_color)
+            
+            # Regenerate combined overlay
+            self.regenerate_combined_mask_overlay()
+            
+            print(f"Merged masks for label '{existing_label}'")
+
+            # Inform the point strategy about the updated expanded mask.
+            try:
+                if hasattr(self, 'point_strategy') and self.point_strategy is not None:
+                    # Update expanded_masks in the strategy if present
+                    if hasattr(self.point_strategy, 'expanded_masks'):
+                        if len(self.point_strategy.expanded_masks) > mask_index:
+                            self.point_strategy.expanded_masks[mask_index] = union_mask
+                        else:
+                            self.point_strategy.expanded_masks.append(union_mask)
+            except Exception:
+                pass
+            
+            # Clear points and reset UI
+            self.positive_points = []
+            self.negative_points = []
+            self.finish_button.setEnabled(True)
+            self.switch_button.setEnabled(False)
+            if self.current_point_type == "negative":
+                self.switch_point_type()
+            
+            # Start next point suggestion
+            self.start_next_point_suggestion(union_mask)
+    
+    def handle_different_object_overlap(self, clicked_point, overlap_info):
+        """Handle when user says it's a different object - resolve overlap"""
+        # Add the point and create mask as normal
+        self.positive_points.append(clicked_point)
+        self.last_actual_click = clicked_point
+        
+        # Generate the new mask
+        points = np.array(self.positive_points + self.negative_points)
+        labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points))
+        new_mask = self.segmenter.propagate_points(points, labels, update_expanded_mask=False)
+        
+        if new_mask is not None:
+            # Get label for the new mask
+            dialog = LabelDialog(self.labels, self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                new_label = dialog.selected_label
+                if new_label is None:
+                    new_label = dialog.new_label_edit.text()
+                    if new_label and dialog.chosen_color:
+                        self.labels[new_label] = dialog.chosen_color
+                
+                new_color = self.labels.get(new_label)
+                if new_color:
+                    # Use the merge_overlapping_masks function to resolve overlap
+                    self.resolve_mask_overlap(new_mask, new_label, new_color, overlap_info)
+    
+    def resolve_mask_overlap(self, new_mask, new_label, new_color, overlap_info):
+        """Resolve overlapping masks by keeping non-overlapping parts and handling overlap properly"""
+        # Get the overlapping mask
+        existing_mask = overlap_info['mask']
+        existing_label = overlap_info['label']
+        existing_color = overlap_info['color']
+        overlapping_index = overlap_info['mask_index']
+        
+        # Find the actual overlap area
+        overlap_area = np.logical_and(new_mask, existing_mask)
+        overlap_pixels = np.sum(overlap_area)
+        
+        if overlap_pixels == 0:
+            # No actual overlap, just add the new mask
+            self.expanded_masks.append((new_mask.astype(np.uint8), new_label, new_color))
+        else:
+            # There is actual overlap - resolve it
+            # Remove overlap from existing mask (existing mask keeps non-overlapping parts)
+            existing_mask_cleaned = np.logical_and(existing_mask, ~overlap_area).astype(np.uint8)
+            
+            # Remove overlap from new mask (new mask keeps non-overlapping parts)  
+            new_mask_cleaned = np.logical_and(new_mask, ~overlap_area).astype(np.uint8)
+            
+            # Assign the overlap area to the new mask (since user clicked there)
+            overlap_mask = overlap_area.astype(np.uint8)
+            new_mask_with_overlap = np.logical_or(new_mask_cleaned, overlap_mask).astype(np.uint8)
+            
+            # Update the existing mask (remove the overlapping index and add cleaned version)
+            self.expanded_masks[overlapping_index] = (existing_mask_cleaned, existing_label, existing_color)
+            
+            # Add the new mask with the overlap area
+            self.expanded_masks.append((new_mask_with_overlap, new_label, new_color))
+        
+        # Regenerate combined overlay
+        self.regenerate_combined_mask_overlay()
+        
+        # Clear points and reset UI
+        self.positive_points = []
+        self.negative_points = []
+        self.finish_button.setEnabled(True)
+        self.switch_button.setEnabled(False)
+        if self.current_point_type == "negative":
+            self.switch_point_type()
+        
+        # Start next point suggestion with the new mask
+        if self.expanded_masks:
+            last_mask = self.expanded_masks[-1][0]  # Use the last created mask
+            self.start_next_point_suggestion(last_mask)
+        
+        # Force display update to show the merged masks
+        self.update_display_with_current_state()
+    
+    def start_next_point_suggestion(self, last_mask):
+        """Start the next point suggestion thread"""
+        if hasattr(self, 'point_strategy') and self.point_strategy is not None:
+            # Extract features for the mask
+            area = np.sum(last_mask)
+            if area > 0:
+                y_coords, x_coords = np.where(last_mask)
+                centroid_y, centroid_x = np.mean(y_coords), np.mean(x_coords)
+                last_feature = np.array([area, centroid_y, centroid_x])
+            else:
+                last_feature = np.array([0, 0, 0])
+            
+            # Convert user click from (x, y) to (y, x) format for the strategy
+            actual_click_yx = None
+            if self.last_actual_click:
+                x, y = self.last_actual_click
+                actual_click_yx = (y, x)
+            
+            # Start new thread
+            self.point_thread = PointSuggestionThread(
+                self.point_strategy, 
+                self.segmenter, 
+                self.current_image,
+                expanded_masks=self.expanded_masks,
+                last_mask=last_mask,
+                last_feature=last_feature,
+                actual_last_point=actual_click_yx
+            )
+            self.point_thread.result_ready.connect(lambda next_point: self.on_next_point_ready(next_point))
+            self.point_thread.error_occurred.connect(lambda error: self.on_next_point_error(error))
+            self.point_thread.start()
+            
+            # Reset the actual click tracking after using it
+            self.last_actual_click = None
+        
+        # Update display
+        self.update_display_with_current_state()
+
     def update_display_with_current_state(self):
         """Update the display with current masks and points"""
         # Start with the original image
@@ -1096,7 +1075,7 @@ class ImageViewer(QWidget):
                 colored_mask[mask > 0] = [color.red(), color.green(), color.blue()]
                 combined_overlay[mask > 0] = colored_mask[mask > 0]
             
-            overlay_image = cv2.addWeighted(overlay_image, 1.0, combined_overlay, 0.6, 0)
+            overlay_image = cv2.addWeighted(overlay_image, 1.0, combined_overlay, 0.8, 0)
         
         # Draw points in creation mode
         if self.current_mode == "creation":
@@ -1106,7 +1085,7 @@ class ImageViewer(QWidget):
             for point in self.negative_points:
                 cv2.circle(overlay_image, point, 4, (255, 0, 0), -1)  # Red for negative
             
-            # Add suggested point if it exists
+            # Always show suggested point (arrow/cross) during labeling
             if hasattr(self, 'suggested_point') and self.suggested_point:
                 row, col = self.suggested_point
                 cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
@@ -1131,7 +1110,7 @@ class ImageViewer(QWidget):
                 # Start with original image and add cached overlay if masks are visible
                 overlay_image = self.current_image.copy()
                 if self.masks_visible and self.combined_mask_overlay is not None:
-                    overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.6, 0)
+                    overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.8, 0)
                 
                 # Create points array with only existing points
                 points = np.array(self.positive_points + self.negative_points)
@@ -1187,64 +1166,67 @@ class ImageViewer(QWidget):
 
     def on_cursor_over_button(self):
         """Called when cursor enters any button"""
-        if self.is_selecting_points:
-            # If in visualization mode (masks hidden), don't show any masks
-            if self.current_mode == "visualization" or not self.masks_visible:
-                # Just show the base image without any masks
-                overlay_image = self.current_image.copy()
-                
-                # Add suggested point if needed in this mode
-                if hasattr(self, 'suggested_point') and self.suggested_point and self.current_mode == "creation":
-                    row, col = self.suggested_point
-                    cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
-                    cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
-                    
-                self.update_display(overlay_image)
-                return
+        # First check if we're in labeling mode and if all required objects exist
+        if not self.is_selecting_points or self.current_image is None or self.segmenter is None:
+            return
             
-            # For regular mode with visible masks - continue with existing behavior
-            if self.positive_points or self.negative_points:
-                points = np.array(self.positive_points + self.negative_points)
-                labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points))
-                preview_mask = self.segmenter.propagate_points(points, labels, update_expanded_mask=False)
-                
-                # Start with original image and add cached overlay if it exists
-                overlay_image = self.current_image.copy()
-                if self.combined_mask_overlay is not None:
-                    overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.6, 0)
-                
-                # Add the preview mask if it exists
-                if preview_mask is not None:
-                    colored_preview = np.zeros_like(overlay_image)
-                    colored_preview[preview_mask > 0] = (128, 128, 128)  # Gray instead of green
-                    overlay_image = cv2.addWeighted(overlay_image, 1.0, colored_preview, 0.4, 0)
-                
-                # Draw all current points
-                for point in self.positive_points:
-                    cv2.circle(overlay_image, point, 4, (0, 255, 0), -1)  # Green for positive
-                for point in self.negative_points:
-                    cv2.circle(overlay_image, point, 4, (255, 0, 0), -1)  # Red for negative
-                
-                # Add suggested point if it exists
-                if hasattr(self, 'suggested_point') and self.suggested_point:
-                    row, col = self.suggested_point
-                    cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
-                    cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
-                
-                self.update_display(overlay_image)
-            else:
-                # If no points are placed, just show the base image with any existing overlay
-                overlay_image = self.current_image.copy()
-                if self.combined_mask_overlay is not None and self.masks_visible:
-                    overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.6, 0)
-                
-                # Add suggested point if it exists
-                if hasattr(self, 'suggested_point') and self.suggested_point:
-                    row, col = self.suggested_point
-                    cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
-                    cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
-                
-                self.update_display(overlay_image)
+        # If in visualization mode (masks hidden), don't show any masks
+        if self.current_mode == "visualization" or not self.masks_visible:
+            # Just show the base image without any masks
+            overlay_image = self.current_image.copy()
+            
+            # Show suggested point when hovering over buttons
+            if hasattr(self, 'suggested_point') and self.suggested_point and self.current_mode == "creation":
+                row, col = self.suggested_point
+                cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
+                cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+            
+            self.update_display(overlay_image)
+            return
+        
+        # For regular mode with visible masks - continue with existing behavior
+        if self.positive_points or self.negative_points:
+            points = np.array(self.positive_points + self.negative_points)
+            labels = np.array([1] * len(self.positive_points) + [0] * len(self.negative_points))
+            preview_mask = self.segmenter.propagate_points(points, labels, update_expanded_mask=False)
+            
+            # Start with original image and add cached overlay if it exists
+            overlay_image = self.current_image.copy()
+            if self.combined_mask_overlay is not None:
+                overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.8, 0)
+
+            # Add the preview mask if it exists
+            if preview_mask is not None:
+                colored_preview = np.zeros_like(overlay_image)
+                colored_preview[preview_mask > 0] = (128, 128, 128)  # Gray instead of green
+                overlay_image = cv2.addWeighted(overlay_image, 1.0, colored_preview, 0.4, 0)
+            
+            # Draw all current points
+            for point in self.positive_points:
+                cv2.circle(overlay_image, point, 4, (0, 255, 0), -1)  # Green for positive
+            for point in self.negative_points:
+                cv2.circle(overlay_image, point, 4, (255, 0, 0), -1)  # Red for negative
+            
+            # Show suggested point when hovering over buttons
+            if hasattr(self, 'suggested_point') and self.suggested_point:
+                row, col = self.suggested_point
+                cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
+                cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+            
+            self.update_display(overlay_image)
+        else:
+            # If no points are placed, just show the base image with any existing overlay
+            overlay_image = self.current_image.copy()
+            if self.combined_mask_overlay is not None and self.masks_visible:
+                overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.8, 0)
+            
+            # Show suggested point when hovering over buttons
+            if hasattr(self, 'suggested_point') and self.suggested_point:
+                row, col = self.suggested_point
+                cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
+                cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+            
+            self.update_display(overlay_image)
 
     def dynamic_expand(self, pos):
         """Handle dynamic expansion with cursor position"""
@@ -1260,30 +1242,24 @@ class ImageViewer(QWidget):
         # First check if we're over an existing mask
         mask_index = self.get_mask_at_position(cursor_point)
         
-        # If over a mask, switch to selection behavior
+        # Update cursor and mask selection state
         if mask_index is not None and self.masks_visible:
             # If we just entered a mask, switch to pointing hand cursor
             if not self.is_over_mask or self.current_mask_index != mask_index:
                 self.is_over_mask = True
                 self.current_mask_index = mask_index
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
-                # Update display to highlight the mask
-                self.update_display_with_current_state()
-            # Skip dynamic expansion while over a mask
-            return
         else:
             # If we just left a mask, reset cursor and selection state
             if self.is_over_mask:
                 self.is_over_mask = False
                 self.current_mask_index = None
                 self.setCursor(Qt.CursorShape.ArrowCursor)
-                # Update display to remove highlight
-                self.update_display_with_current_state()
         
         # Start with original image and add cached overlay if it exists
         overlay_image = self.current_image.copy()
         if self.combined_mask_overlay is not None:
-            overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.6, 0)
+            overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.8, 0)
 
         # Draw all current points
         for point in self.positive_points:
@@ -1303,11 +1279,11 @@ class ImageViewer(QWidget):
             colored_preview[preview_mask > 0] = (128, 128, 128)  # Gray instead of green
             overlay_image = cv2.addWeighted(overlay_image, 1.0, colored_preview, 0.4, 0)
 
-        # Draw cursor point
+        # Draw cursor point (normal mode - just the colored point)
         cursor_color = (0, 255, 0) if self.current_point_type == "positive" else (255, 0, 0)
         cv2.circle(overlay_image, cursor_point, 4, cursor_color, -1)
 
-        # Add suggested point if it exists
+        # Always show suggested point arrow/cross during labeling
         if hasattr(self, 'suggested_point') and self.suggested_point:
             row, col = self.suggested_point
             cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
@@ -1325,6 +1301,7 @@ class ImageViewer(QWidget):
 
         # Two point expansion: fixed positive and moving negative
         points = np.array([self.positive_points[0], cursor_point])
+        # Create appropriate labels (1 for positive points, 0 for negative points)
         labels = np.array([1, 0])
         
         preview_mask = self.segmenter.propagate_points(points, labels, update_expanded_mask=False)
@@ -1332,7 +1309,7 @@ class ImageViewer(QWidget):
         # Start with original image and add cached overlay if it exists
         overlay_image = self.current_image.copy()
         if self.combined_mask_overlay is not None:
-            overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.6, 0)
+            overlay_image = cv2.addWeighted(overlay_image, 1.0, self.combined_mask_overlay, 0.8, 0)
         
         # Add the preview mask
         if preview_mask is not None:
@@ -1345,7 +1322,7 @@ class ImageViewer(QWidget):
         cv2.circle(overlay_image, (pos_x, pos_y), 4, (0, 255, 0), -1)  # Green for positive
         cv2.circle(overlay_image, cursor_point, 4, (255, 0, 0), -1)  # Red for negative
 
-        # Add suggested point if it exists (in case it's needed in this mode)
+        # Show suggested point cross during negative point expansion too
         if hasattr(self, 'suggested_point') and self.suggested_point:
             row, col = self.suggested_point
             cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
@@ -1410,7 +1387,7 @@ class ImageViewer(QWidget):
             for mask, label, color in self.expanded_masks:
                 colored_mask = np.zeros_like(image)
                 colored_mask[mask > 0] = [color.red(), color.green(), color.blue()]
-                image = cv2.addWeighted(image, 1.0, colored_mask, 0.6, 0)
+                image = cv2.addWeighted(image, 1.0, colored_mask, 0.8, 0)
 
         # Store the current state of the overlay
         self.overlay_image = image.copy()
@@ -1443,24 +1420,20 @@ class ImageViewer(QWidget):
             self.reset_viewer()
             return
 
-        # If we have started labeling (segmenter exists), ask for confirmation
-        if self.segmenter is not None:
-            confirmation = QMessageBox(self)
-            confirmation.setWindowTitle("Next Image")
-            confirmation.setText("Do you want to save the current labeling and move to the next image?")
-            confirmation.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            response = confirmation.exec()
-            
-            if response == QMessageBox.StandardButton.Cancel:
-                return
-            elif response == QMessageBox.StandardButton.Yes:
-                self.save_image(self.image_list[self.current_index])
+        # If we have expanded masks, ask what to save
+        if self.expanded_masks:
+            save_dialog = SaveDialog(self)
+            if save_dialog.exec() == QDialog.DialogCode.Accepted:
+                if save_dialog.selected_option:
+                    self.save_image(self.image_list[self.current_index], save_dialog.selected_option)
+            # Continue to next image regardless of save choice
 
         # Disable image interactions until Start button is pressed again
         self.image_label.interactions_enabled = False
         
         # Reset all the labeling-related variables
         self.segmenter = None
+        self.plas_segmenter = None  # Reset PLAS segmenter
         self.expanded_masks = []
         self.overlay_image = None
         self.suggested_point = None
@@ -1477,6 +1450,8 @@ class ImageViewer(QWidget):
         self.current_index += 1
         
         if self.current_index < len(self.image_list):
+            # Reset point strategy for new image
+            self.point_strategy = None
             # Load and display the new image
             current_image_path = self.image_list[self.current_index]
             image = cv2.imread(current_image_path)
@@ -1487,56 +1462,138 @@ class ImageViewer(QWidget):
             QMessageBox.information(self, "Finished", "You have finished labeling all the images.")
             self.reset_viewer()
 
-    def save_image(self, image_path):
+    def save_image(self, image_path, save_type="combined"):
         if not self.expanded_masks:  # If no masks were created, don't save anything
             return
             
-        # Create a black background image
+        # Create a background image with custom color
         height, width, _ = self.current_image.shape
-        mask_image = np.zeros((height, width, 3), dtype=np.uint8)  # Black background
+        background_color = [63, 69, 131]  # Custom RGB background color
+        
+        # Create the SAM2 segmentation mask
+        sam2_mask_image = np.full((height, width, 3), fill_value=background_color, dtype=np.uint8)  # Custom background
         
         # Add all expanded masks with their respective colors
         for mask, label, color in self.expanded_masks:
-            colored_mask = np.zeros_like(mask_image)
+            colored_mask = np.zeros_like(sam2_mask_image)
             colored_mask[mask > 0] = [color.red(), color.green(), color.blue()]
             # Use direct assignment instead of addWeighted since we want solid colors
-            mask_image[mask > 0] = colored_mask[mask > 0]
+            sam2_mask_image[mask > 0] = colored_mask[mask > 0]
         
-        # Save the mask image
-        save_folder = os.path.join(os.getcwd(), "labeled_masks")
-        os.makedirs(save_folder, exist_ok=True)
+        # Prepare session subfolder based on date and hour
+        from datetime import datetime
+        if not hasattr(self, 'session_save_folder'):
+            session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.session_save_folder = os.path.join(os.getcwd(), "app_annotations", session_id)
+            os.makedirs(self.session_save_folder, exist_ok=True)
+        save_folder = self.session_save_folder
         image_name = os.path.basename(image_path)
         base_name, ext = os.path.splitext(image_name)
-        save_path = os.path.join(save_folder, f"{base_name}_mask{ext}")
         
-        # Convert from RGB to BGR for cv2.imwrite
-        mask_image_bgr = cv2.cvtColor(mask_image, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(save_path, mask_image_bgr)
+        if save_type in ["sam2_only", "both"]:
+            # Save SAM2-only mask
+            sam2_path = os.path.join(save_folder, f"{base_name}_sam2_mask{ext}")
+            sam2_mask_bgr = cv2.cvtColor(sam2_mask_image, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(sam2_path, sam2_mask_bgr)
+            print(f"Saved SAM2-only segmentation to: {sam2_path}")
+        
+        if save_type in ["combined", "both"]:
+            # Create combined SAM2+PLAS mask
+            try:
+                # Prepare points and labels for PLAS expansion
+                points_to_process = []
+                labels_to_process = []
+                int_labels_to_rgb = {}
+                
+                for i, (mask, label, color) in enumerate(self.expanded_masks):
+                    # Sample some points from each mask for PLAS expansion
+                    mask_indices = np.argwhere(mask > 0)
+                    if len(mask_indices) > 0:
+                        # Sample up to 5 points per mask
+                        sample_size = min(5, len(mask_indices))
+                        sampled_indices = np.random.choice(len(mask_indices), sample_size, replace=False)
+                        sampled_points = mask_indices[sampled_indices]
+                        
+                        # Convert from (row, col) to (col, row) format for PLAS
+                        sampled_points_xy = [(point[1], point[0]) for point in sampled_points]
+                        
+                        points_to_process.extend(sampled_points_xy)
+                        labels_to_process.extend([i + 1] * len(sampled_points))  # Start labels from 1
+                        int_labels_to_rgb[i + 1] = [color.red(), color.green(), color.blue()]
+                
+                if points_to_process and hasattr(self, 'plas_segmenter'):
+                    # Get SAM2 features if available
+                    features_sam2 = getattr(self.segmenter, 'features_sam2', None)
+                    
+                    # PLAS expansion
+                    plas_mask = self.plas_segmenter.expand_labels(
+                        self.current_image, 
+                        points_to_process, 
+                        labels_to_process, 
+                        features_sam2=features_sam2
+                    )
+                    
+                    # Create PLAS mask RGB
+                    plas_mask_rgb = np.full((height, width, 3), fill_value=background_color, dtype=np.uint8)
+                    for label, color in int_labels_to_rgb.items():
+                        plas_mask_rgb[plas_mask == label] = color
+                    
+                    # Combine SAM2 and PLAS: where SAM2 is unlabeled (black), use PLAS
+                    combined_mask_rgb = sam2_mask_image.copy()
+                    unlabeled_pixels = np.all(sam2_mask_image == background_color, axis=2)
+                    combined_mask_rgb[unlabeled_pixels] = plas_mask_rgb[unlabeled_pixels]
+                    
+                    # Save combined mask
+                    combined_path = os.path.join(save_folder, f"{base_name}_combined_mask{ext}")
+                    combined_mask_bgr = cv2.cvtColor(combined_mask_rgb, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(combined_path, combined_mask_bgr)
+                    print(f"Saved combined SAM2+PLAS segmentation to: {combined_path}")
+                else:
+                    print("PLAS segmenter not available, saving SAM2-only instead")
+                    fallback_path = os.path.join(save_folder, f"{base_name}_combined_mask{ext}")
+                    sam2_mask_bgr = cv2.cvtColor(sam2_mask_image, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(fallback_path, sam2_mask_bgr)
+                    print(f"Saved SAM2-only (fallback) segmentation to: {fallback_path}")
+                    
+            except Exception as e:
+                print(f"Error during PLAS combination: {e}")
+                # Fallback to SAM2 only
+                fallback_path = os.path.join(save_folder, f"{base_name}_combined_mask{ext}")
+                sam2_mask_bgr = cv2.cvtColor(sam2_mask_image, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(fallback_path, sam2_mask_bgr)
+                print(f"Saved SAM2-only (error fallback) segmentation to: {fallback_path}")
 
     def reset_viewer(self):
         self.image_label.clear()
         self.image_list = []
         self.current_index = 0
+        self.segmenter = None
+        self.plas_segmenter = None  # Reset PLAS segmenter
+        self.point_strategy = None  # Reset point strategy
         self.start_button.setEnabled(False)
         self.next_button.setEnabled(False)
         self.prev_button.setEnabled(False)
 
     def closeEvent(self, event):
-        if self.image_list and 0 <= self.current_index < len(self.image_list):
-            confirmation = QMessageBox(self)
-            confirmation.setWindowTitle("Save Image")
-            confirmation.setText("Do you want to save the current image before exiting?")
-            confirmation.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            confirmation.setDefaultButton(QMessageBox.StandardButton.No)
-
-            user_response = confirmation.exec()
-            if user_response == QMessageBox.StandardButton.Yes:
-                self.save_image(self.image_list[self.current_index])
-                event.accept()
-            elif user_response == QMessageBox.StandardButton.No:
+        if self.image_list and 0 <= self.current_index < len(self.image_list) and self.expanded_masks:
+            # Only show save dialog if there are masks to save
+            save_dialog = SaveDialog(self)
+            if save_dialog.exec() == QDialog.DialogCode.Accepted:
+                if save_dialog.selected_option:
+                    self.save_image(self.image_list[self.current_index], save_dialog.selected_option)
                 event.accept()
             else:
-                event.ignore()
+                # User cancelled, ask if they want to exit without saving
+                confirmation = QMessageBox(self)
+                confirmation.setWindowTitle("Exit without saving")
+                confirmation.setText("Are you sure you want to exit without saving?")
+                confirmation.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                confirmation.setDefaultButton(QMessageBox.StandardButton.No)
+                
+                if confirmation.exec() == QMessageBox.StandardButton.Yes:
+                    event.accept()
+                else:
+                    event.ignore()
         else:
             event.accept()
 
@@ -1596,73 +1653,27 @@ class ImageViewer(QWidget):
             # Clear points for next mask
             self.positive_points = []
             self.negative_points = []
-
-    def on_expansion_finished(self, mask):
-        """Handle mask expansion completion"""
-        if mask is not None:
-            # Update current mask
-            self.current_mask = mask
-            
-            # Update expanded areas mask
-            if not hasattr(self, 'expanded_areas_mask') or self.expanded_areas_mask is None:
-                self.expanded_areas_mask = mask.copy()
-            else:
-                self.expanded_areas_mask = np.logical_or(self.expanded_areas_mask, mask)
-            
-            # Calculate coverage stats
-            self.current_mask_area = np.sum(mask)
-            self.total_image_area = self.current_image.shape[0] * self.current_image.shape[1]
-            self.coverage_ratio = self.current_mask_area / self.total_image_area
-            
-            # Output coverage info to console
-            print(f"Current Mask Coverage: {self.coverage_ratio:.2%}")
-            
-            # Check for auto-assignment of label
-            should_auto = False
-            predicted_label = None
-            if hasattr(self, 'label_predictor'):
-                should_auto, predicted_label = self.label_predictor.should_auto_assign(self.current_image, mask)
-            
-            if should_auto:
-                # Auto-assign the label
-                self.current_label = predicted_label
-                print(f"Auto-assigned label: {predicted_label}")
-            else:
-                # Get predictions for suggestions
-                predictions = self.label_predictor.predict_label(self.current_image, mask)
-                if predictions:
-                    print("Label suggestions:")
-                    for label, prob in predictions:
-                        print(f"- {label}: {prob:.2%}")
-            
-            # Update the display
-            self.update_display_with_current_state()
-            self.finish_button.setEnabled(True)
-            self.is_expanding = False
+            # Note: Don't reset last_actual_click here - it's needed for the next thread
 
     def prev_image(self):
         """Move to the previous image"""
         if not self.image_list or self.current_index <= 0:
             return
 
-        # If we have started labeling (segmenter exists), ask for confirmation
-        if self.segmenter is not None:
-            confirmation = QMessageBox(self)
-            confirmation.setWindowTitle("Previous Image")
-            confirmation.setText("Do you want to save the current labeling and move to the previous image?")
-            confirmation.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            response = confirmation.exec()
-            
-            if response == QMessageBox.StandardButton.Cancel:
-                return
-            elif response == QMessageBox.StandardButton.Yes:
-                self.save_image(self.image_list[self.current_index])
+        # If we have expanded masks, ask what to save
+        if self.expanded_masks:
+            save_dialog = SaveDialog(self)
+            if save_dialog.exec() == QDialog.DialogCode.Accepted:
+                if save_dialog.selected_option:
+                    self.save_image(self.image_list[self.current_index], save_dialog.selected_option)
+            # Continue to previous image regardless of save choice
 
         # Disable image interactions until Start button is pressed again
         self.image_label.interactions_enabled = False
         
         # Reset all the labeling-related variables
         self.segmenter = None
+        self.plas_segmenter = None  # Reset PLAS segmenter
         self.expanded_masks = []
         self.overlay_image = None
         self.suggested_point = None
@@ -1683,20 +1694,6 @@ class ImageViewer(QWidget):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         self.current_image = image
         self.show_image()
-
-    def on_label_changed(self, label):
-        """Handle label selection change"""
-        self.current_label = label
-        if self.current_mask is not None:
-            # Get predictions for the current mask
-            predictions = self.label_predictor.predict_label(self.image, self.current_mask)
-            if predictions:
-                print(f"Predictions for current mask with label '{label}':")
-                for pred_label, prob in predictions:
-                    print(f"- {pred_label}: {prob:.2%}")
-            
-            # Update UI
-            self.update_image_display()
 
     # Add this method to the ImageViewer class
     def keyPressEvent(self, event):
@@ -1736,25 +1733,76 @@ class ImageViewer(QWidget):
         super().keyPressEvent(event)
 
     def is_mask_overlapping(self, new_mask):
-        """Check if a mask has significant overlap with any existing mask"""
+        """Check if a mask has significant overlap with any existing mask."""
         if not self.expanded_masks:
             return False
-        
-        # Calculate total new mask area
+
+        # Create a combined binary mask of all existing masks
+        if not hasattr(self, 'combined_binary_mask') or self.combined_binary_mask is None:
+            self.combined_binary_mask = np.zeros_like(new_mask, dtype=bool)
+            for mask, _, _ in self.expanded_masks:
+                self.combined_binary_mask = np.logical_or(self.combined_binary_mask, mask)
+
+        # Check overlap with the combined mask
+        overlap = np.logical_and(self.combined_binary_mask, new_mask)
+        overlap_area = np.sum(overlap)
         new_mask_area = np.sum(new_mask)
-        if new_mask_area == 0:
-            return False
+        return overlap_area / new_mask_area > 0.25
+
+class SaveDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Save Segmentation")
+        self.setModal(True)
+        self.selected_option = None
         
-        # Check against each existing mask
-        for mask, _, _ in self.expanded_masks:
-            overlap = np.logical_and(mask, new_mask)
-            overlap_area = np.sum(overlap)
-            
-            # If more than 25% overlaps with existing mask, consider it overlapping
-            if overlap_area / new_mask_area > 0.25:
-                return True
+        # Load the stylesheet for buttons
+        stylesheet = load_stylesheet("app_modules/button_styles.qss")
+        self.setStyleSheet(stylesheet)
         
-        return False
+        layout = QVBoxLayout()
+        
+        # Title label
+        title_label = QLabel("Choose what to save:")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title_label)
+        
+        # Buttons with proper styling
+        self.sam2_only_button = QPushButton("SAM2 Only")
+        self.sam2_only_button.clicked.connect(self.save_sam2_only)
+        self.sam2_only_button.setProperty("class", "start-button")  # Blue style
+        layout.addWidget(self.sam2_only_button)
+        
+        self.combined_button = QPushButton("SAM2 + PLAS Combined")
+        self.combined_button.clicked.connect(self.save_combined)
+        self.combined_button.setProperty("class", "start-button")  # Blue style
+        layout.addWidget(self.combined_button)
+        
+        self.both_button = QPushButton("Both (SAM2 Only + Combined)")
+        self.both_button.clicked.connect(self.save_both)
+        self.both_button.setProperty("class", "start-button")  # Blue style
+        layout.addWidget(self.both_button)
+        
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+        self.cancel_button.setProperty("class", "select-folder-button")  # Neutral style
+        layout.addWidget(self.cancel_button)
+        
+        self.setLayout(layout)
+        self.resize(300, 200)
+    
+    def save_sam2_only(self):
+        self.selected_option = "sam2_only"
+        self.accept()
+    
+    def save_combined(self):
+        self.selected_option = "combined"
+        self.accept()
+    
+    def save_both(self):
+        self.selected_option = "both"
+        self.accept()
+
 
 # Run the application
 app = QApplication(sys.argv)

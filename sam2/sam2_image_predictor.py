@@ -192,7 +192,7 @@ class SAM2ImagePredictor:
         self._features = {"image_embed": feats[-1], "high_res_feats": feats[:-1]}
         self._is_image_set = True
         self._is_batch = True
-        logging.info("Image embeddings computed.")
+        logging.info("Image embeddings computed batch.")
 
     def predict_batch(
         self,
