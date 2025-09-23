@@ -719,9 +719,8 @@ class ToolSelectionStrategy(PointSelectionStrategy):
       - The acquisition map uses exploration + exploitation similar to DynamicPointsSelectionStrategy but
         does NOT multiply by any user preference map.
     """
-    def __init__(self, num_points=30, lambda_balance=0.5, heatmap_fraction=0.5):
+    def __init__(self, num_points=None, lambda_balance=0.5, heatmap_fraction=0.5):
         super().__init__()
-        self.num_points = int(num_points)
         self.lambda_balance = (1 - float(lambda_balance))
         # per-image placeholders
         self.image_shape = None
@@ -799,6 +798,7 @@ class ToolSelectionStrategy(PointSelectionStrategy):
         H, W = self.image_shape
         N = self.pix.shape[0]
 
+        # Exploration term: distance from selected points
         d_prev = self._d_prev_pix if self._d_prev_pix is not None else np.full(N, self.d_max)
         E_map = np.clip(d_prev / self.d_max, 0.0, 1.0)
 
@@ -808,11 +808,12 @@ class ToolSelectionStrategy(PointSelectionStrategy):
         if len(self.selected_points) >= len(self.mask_centroids):
             return E_map.reshape(H, W)
 
+        # --- Centroid weighting with Gaussian attenuation ---
         w = self.mask_weights.copy()
         if self.selected_points and self._d_centroid_min is not None:
-            sigma = getattr(self, 'suppression_sigma', 6.0)
+            sigma = float(getattr(self, 'suppression_sigma', 15.0))
             d_cent_sel = self._d_centroid_min
-            atten = np.exp(- (d_cent_sel ** 2) / (2 * sigma ** 2))
+            atten = np.exp(-(d_cent_sel ** 2) / (2.0 * sigma * sigma))
             w *= (1.0 - atten)
         w = np.maximum(w, 0.0)
         sw = w.sum()
@@ -821,6 +822,7 @@ class ToolSelectionStrategy(PointSelectionStrategy):
         else:
             w = self.mask_weights.copy()
 
+        # --- Object-level acquisition ---
         if self._K is None or self._base_centroid_term is None:
             eps = 1e-6
             self._K = (1.0 / (self.d_to_cent + eps)).astype(np.float32)
@@ -830,124 +832,101 @@ class ToolSelectionStrategy(PointSelectionStrategy):
         raw_weighted = (self._base_centroid_term * w[np.newaxis, :])
         num_C = np.einsum('ij,ij->i', self._K, raw_weighted, optimize=True)
         O_map = num_C / self._den_C
-        cmin = float(O_map.min())
-        cmax = float(O_map.max())
+        cmin, cmax = float(O_map.min()), float(O_map.max())
         if cmax > cmin:
             O_map = (O_map - cmin) / (cmax - cmin)
         else:
             O_map = np.zeros_like(O_map)
+        
+        self._last_O_map = O_map.reshape(H, W) 
 
-        A = ( self.lambda_balance * O_map + (1 - self.lambda_balance) * E_map)
-        return A.reshape(H, W)
+        # --- Blend exploration & exploitation ---
+        A = (self.lambda_balance * O_map + (1 - self.lambda_balance) * E_map).reshape(H, W)
+
+        # --- Hard suppression window around selected points ---
+        if self.selected_points:
+            sigma = float(getattr(self, 'suppression_sigma', 15.0))
+            Y, X = np.ogrid[:H, :W]
+            for py, px in self.selected_points:
+                if 0 <= py < H and 0 <= px < W:
+                    dist2 = (Y - py) ** 2 + (X - px) ** 2
+                    suppression = 1.0 - np.exp(-dist2 / (2.0 * sigma * sigma))
+                    A *= suppression
+
+        return A
+
 
     def display_acquisition_heatmap(self, A_map, next_point=None):
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(10, 8))
-        plt.imshow(A_map, origin='upper', cmap='viridis')
-        if next_point is not None:
-            y, x = next_point
-            plt.scatter(x, y, s=100, facecolors='none', edgecolors='red', linewidth=2)
-        plt.axis('off')
-        plt.colorbar(label='Acquisition Score')
-        plt.title('Adaptive Interactive Strategy - Acquisition Map')
-        plt.show(block=False)
-        plt.pause(0.001)
+        # Disabled: Do not call Matplotlib GUI from threads. Use main-thread slot in app.py instead.
+        pass
 
     def display_acquisition_heatmap_main_thread(self, A_map, next_point=None):
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(10, 8))
-        plt.imshow(A_map, origin='upper', cmap='viridis')
-        if next_point is not None:
-            y, x = next_point
-            plt.scatter(x, y, s=100, facecolors='none', edgecolors='red', linewidth=2)
-        plt.axis('off')
-        plt.colorbar(label='Acquisition Score')
-        plt.title('Adaptive Interactive Strategy - Next Point')
-        plt.show(block=False)
-        plt.pause(0.001)
+        # Disabled: Use main-thread slot in app.py for Matplotlib display.
+        pass
 
     def display_last_acquisition_map(self):
-        if hasattr(self, '_last_acquisition_map') and hasattr(self, '_last_selected_point'):
-            self.display_acquisition_heatmap(self._last_acquisition_map, self._last_selected_point)
+        # Disabled: Do not call Matplotlib GUI from threads.
+        pass
     
 
     def select_points(self, segmenter, image, gt_masks, expanded_masks=None):
-        """Conform to the abstract API: produce up to `num_points` suggestions for the given image.
+        pass
 
-        This implementation performs a lightweight setup and then iteratively calls
-        `get_next_point` (without actual_last_point) to build a list of suggestions.
-        It is deliberately conservative: it does not modify the segmenter or any external state.
-        """
-        # If image or generated masks not provided, return empty
-        if image is None:
-            return np.empty((0,2), dtype=int), None
+    def _get_random_point(self, H, W):
+        sam_union = np.zeros((H, W), bool)
+        for m in getattr(self, "generated_masks", []):
+            sam_union |= m['segmentation'].astype(bool)
+        exp_union = np.zeros((H, W), bool)
+        for em in self.expanded_masks:
+            exp_union |= em.astype(bool)
 
-        # Try to extract generated masks from the segmenter if available, else empty list
-        generated_masks = []
-        if hasattr(segmenter, 'masks') and segmenter.masks:
-            for md in segmenter.masks:
-                seg = md.get('segmentation')
-                if seg is None:
-                    continue
-                generated_masks.append({'segmentation': seg, 'predicted_iou': md.get('predicted_iou', 0.0)})
+        candidate_mask = ~sam_union & ~exp_union
+        for pt in self.selected_points:
+            py, px = int(pt[0]), int(pt[1])
+            if 0 <= py < H and 0 <= px < W:
+                candidate_mask[py, px] = False
 
-        # Do fast setup; fall back to safe empty output if setup fails
-        try:
-            self.setup_simple(image, generated_masks)
-        except Exception:
-            return np.empty((0,2), dtype=int), None
+        ys, xs = np.where(candidate_mask)
+        if len(ys) > 0:
+            idx = self._rng.integers(len(ys))
+            y, x = int(ys[idx]), int(xs[idx])
+        else:
+            y, x = int(self._rng.integers(0, H)), int(self._rng.integers(0, W))
 
-        pts = []
-        last_mask = None
-        for _ in range(self.num_points):
-            try:
-                p = self.get_next_point(last_mask=last_mask)
-            except Exception:
-                break
-            if p is None:
-                break
-            pts.append((int(p[0]), int(p[1])))
-            # Do not modify last_mask here; caller is responsible for propagation
-            last_mask = None
+        self._last_acquisition_map = None
+        self._last_selected_point = None
+        print(f"[DEBUG] RANDOM point selected: (y={y}, x={x})")
+        return (y, x)
 
-        if not pts:
-            return np.empty((0,2), dtype=int), None
-        return np.asarray(pts, dtype=int), None
 
     def get_next_point(self, last_mask=None, actual_last_point=None):
         """
         Choose the next sampling point, learning from where the user actually clicked.
-        
-        Args:
-            last_mask:    bool mask of the last point's propagated region
-            last_feature: feature vector of that last mask
-            actual_last_point: (y, x) where the user actually clicked (vs where we suggested)
-        Returns:
-            (y, x) tuple for the next sample
         """
-    # Record last iteration's mask (unioned by caller)
+        # Record last iteration's mask (unioned by caller)
         if last_mask is not None:
             try:
                 self.expanded_masks.append(last_mask)
+                self._last_mask_area = np.sum(last_mask)
+                print(f"[DEBUG] Last mask area: {self._last_mask_area} pixels")
             except Exception:
+                print("[DEBUG] Failed to record last mask area")
                 pass
-
         H, W = self.image_shape
 
-        # If caller provided the actual last point (user click), treat it as the most-recent selection
+        # If caller provided the actual last point (user click), update caches
         if actual_last_point is not None:
             try:
                 sel_pt = (int(actual_last_point[0]), int(actual_last_point[1]))
-                # Append to selected history and update caches immediately
                 self.selected_points.append(np.array(sel_pt))
 
-                if hasattr(self, '_d_prev_pix') and self._d_prev_pix is not None:
+                if self._d_prev_pix is not None:
                     dy = self._pix_y - sel_pt[0]
                     dx = self._pix_x - sel_pt[1]
                     dist_new = np.sqrt(dy * dy + dx * dx).astype(np.float32)
                     self._d_prev_pix = np.minimum(self._d_prev_pix, dist_new)
 
-                if hasattr(self, '_d_centroid_min') and self._d_centroid_min is not None:
+                if self._d_centroid_min is not None:
                     dcy = self.mask_centroids[:, 0] - sel_pt[0]
                     dcx = self.mask_centroids[:, 1] - sel_pt[1]
                     dist_cent_new = np.sqrt(dcy * dcy + dcx * dcx).astype(np.float32)
@@ -957,53 +936,63 @@ class ToolSelectionStrategy(PointSelectionStrategy):
             except Exception:
                 pass
 
-        # Decide whether we're in heatmap or random phase and compute suggestion based on current state
-        threshold_count = math.ceil(self.num_points * self.heatmap_fraction)
-        if self.selected_count < threshold_count:
-            # Heatmap phase - compute acquisition map based on updated caches
+        # --- Dynamic phase (heatmap) ---
+        use_dynamic = not getattr(self, "_dynamic_done", False)
+        if use_dynamic:
             A_map = self.compute_pixel_acquisition_map()
             y, x = np.unravel_index(np.argmax(A_map), A_map.shape)
-            # store for potential display
+
+            # Scores
+            best_A = A_map[y, x]
+            best_O = None
+            if hasattr(self, "_last_O_map") and self._last_O_map is not None:
+                best_O = float(self._last_O_map[y, x])
+
+            # --- Plain image coverage of expanded masks ---
+            coverage = 0.0
             try:
-                self._last_acquisition_map = np.array(A_map, copy=True)
-                # For display, use the suggested point (next candidate)
-                self._last_selected_point = (int(y), int(x))
-            except Exception:
-                self._last_acquisition_map = None
-                self._last_selected_point = None
-        else:
-            # Random phase - exclude sam generated and expanded masks
-            sam_union = np.zeros((H, W), bool)
-            for m in getattr(self, "generated_masks", []):
-                sam_union |= m['segmentation'].astype(bool)
-            exp_union = np.zeros((H, W), bool)
-            for em in self.expanded_masks:
-                exp_union |= em.astype(bool)
-
-            candidate_mask = ~sam_union & ~exp_union
-            for pt in self.selected_points:
-                py, px = int(pt[0]), int(pt[1])
-                if 0 <= py < H and 0 <= px < W:
-                    candidate_mask[py, px] = False
-
-            ys, xs = np.where(candidate_mask)
-            if len(ys) > 0:
-                idx = self._rng.integers(len(ys))
-                y, x = int(ys[idx]), int(xs[idx])
-            else:
-                y, x = int(self._rng.integers(0, H)), int(self._rng.integers(0, W))
-
-            # No useful acquisition map in random phase; clear last map
-            try:
-                self._last_acquisition_map = None
-                self._last_selected_point = None
+                if self.expanded_masks:
+                    exp_union = np.logical_or.reduce([m.astype(bool) for m in self.expanded_masks])
+                    coverage = exp_union.sum() / float(H * W)
             except Exception:
                 pass
 
-        suggested = (int(y), int(x))
+            print(f"[DEBUG] Coverage (image fraction): {coverage:.3f}")
+
+            if best_O is not None:
+                raw_ratio = best_O / (best_A + 1e-8)
+                contrib_ratio = (self.lambda_balance * best_O) / (best_A + 1e-8)
+
+                last_area = getattr(self, "_last_mask_area", 1.0)  # 1.0 = safe default
+                last_area /= float(H * W)
+                print(f"[DEBUG] O/A ratio: {raw_ratio:.3f} | contrib_ratio=(λ·O)/A: {contrib_ratio:.3f}")
+                print(f"[DEBUG] Last mask area fraction: {last_area:.4f}")
+
+                # --- Switch condition ---
+                if coverage > 0 and (contrib_ratio < 0.3 or last_area < 0.001):
+                    self._dynamic_done = True
+                    print("[DEBUG] Switching to RANDOM phase (dynamic exhausted or last mask too small).")
+                    suggested = self._get_random_point(H, W)
+                else:
+                    try:
+                        # self.display_acquisition_heatmap(A_map, next_point=(y, x))
+                        self._last_acquisition_map = np.array(A_map, copy=True)
+                        self._last_selected_point = (int(y), int(x))
+                    except Exception:
+                        self._last_acquisition_map = None
+                        self._last_selected_point = None
+                    suggested = (int(y), int(x))
+
+        # --- Random phase ---
+        else:
+            print("[DEBUG] RANDOM phase: selecting random point outside masks.")
+            suggested = self._get_random_point(H, W)
+
         try:
             self.suggested_points.append(suggested)
+            print(f"[DEBUG] Suggested point: (y={suggested[0]}, x={suggested[1]})")
         except Exception:
+            print("[DEBUG] Failed to record suggested point")
             pass
 
         return suggested

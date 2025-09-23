@@ -80,6 +80,7 @@ class ClickableLabel(QLabel):
 # Thread to suggest the next point using the adaptive interactive selection strategy
 class PointSuggestionThread(QThread):
     result_ready = pyqtSignal(tuple)
+    heatmap_ready = pyqtSignal(object, object)  # (A_map, next_point)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, strategy, segmenter, image, expanded_masks=None, last_mask=None, last_feature=None, actual_last_point=None, parent=None):
@@ -94,11 +95,14 @@ class PointSuggestionThread(QThread):
 
     def run(self):
         try:
-            # Using ToolSelectionStrategy: pass only supported args
             next_point = self.strategy.get_next_point(
                 last_mask=self.last_mask,
                 actual_last_point=self.actual_last_point
             )
+            # If the strategy has a last acquisition map, emit it for main-thread display
+            A_map = getattr(self.strategy, '_last_acquisition_map', None)
+            if A_map is not None:
+                self.heatmap_ready.emit(A_map, next_point)
             self.result_ready.emit(next_point)
         except Exception as e:
             self.error_occurred.emit(str(e))
@@ -442,7 +446,25 @@ class ImageViewer(QWidget):
         )
         self.point_thread.result_ready.connect(lambda next_point: self.on_point_suggestion_complete(next_point, wait_dialog))
         self.point_thread.error_occurred.connect(lambda error: self.on_point_suggestion_error(error, wait_dialog))
+        self.point_thread.heatmap_ready.connect(lambda A_map, next_point: self.display_acquisition_heatmap_main_thread(A_map, next_point))
         self.point_thread.start()
+    def display_acquisition_heatmap_main_thread(self, A_map, next_point):
+        return
+        # This slot runs in the main thread and is safe for Matplotlib GUI
+        try:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(10, 8))
+            plt.imshow(A_map, origin='upper', cmap='viridis')
+            if next_point is not None:
+                y, x = next_point
+                plt.scatter(x, y, s=100, facecolors='none', edgecolors='red', linewidth=2)
+            plt.axis('off')
+            plt.colorbar(label='Acquisition Score')
+            plt.title('Adaptive Interactive Strategy - Acquisition Map')
+            plt.show(block=False)
+            plt.pause(0.001)
+        except Exception as e:
+            print(f"Error displaying heatmap: {e}")
 
     def on_point_suggestion_complete(self, next_point, wait_dialog):
         wait_dialog.accept()
@@ -779,6 +801,7 @@ class ImageViewer(QWidget):
                     )
                     self.point_thread.result_ready.connect(lambda next_point: self.on_next_point_ready(next_point))
                     self.point_thread.error_occurred.connect(lambda error: self.on_next_point_error(error))
+                    self.point_thread.heatmap_ready.connect(lambda A_map, next_point: self.display_acquisition_heatmap_main_thread(A_map, next_point))
                     self.point_thread.start()
                     
                     # Reset the actual click tracking after using it
@@ -911,9 +934,11 @@ class ImageViewer(QWidget):
             
             # Create union of masks
             union_mask = np.logical_or(existing_mask, new_mask).astype(np.uint8)
-            
-            # Replace the existing mask with the union
-            self.expanded_masks[mask_index] = (union_mask, existing_label, existing_color)
+
+            # Remove all masks with the same label (to avoid double-counting)
+            self.expanded_masks = [m for m in self.expanded_masks if m[1] != existing_label]
+            # Add the union mask
+            self.expanded_masks.append((union_mask, existing_label, existing_color))
             
             # Regenerate combined overlay
             self.regenerate_combined_mask_overlay()
@@ -1051,6 +1076,7 @@ class ImageViewer(QWidget):
             )
             self.point_thread.result_ready.connect(lambda next_point: self.on_next_point_ready(next_point))
             self.point_thread.error_occurred.connect(lambda error: self.on_next_point_error(error))
+            self.point_thread.heatmap_ready.connect(lambda A_map, next_point: self.display_acquisition_heatmap_main_thread(A_map, next_point))
             self.point_thread.start()
             
             # Reset the actual click tracking after using it
@@ -1468,7 +1494,8 @@ class ImageViewer(QWidget):
             
         # Create a background image with custom color
         height, width, _ = self.current_image.shape
-        background_color = [63, 69, 131]  # Custom RGB background color
+        # background_color = [63, 69, 131]  # Custom RGB background color
+        background_color = [0, 0, 0]  # White background
         
         # Create the SAM2 segmentation mask
         sam2_mask_image = np.full((height, width, 3), fill_value=background_color, dtype=np.uint8)  # Custom background
