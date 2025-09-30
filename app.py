@@ -607,8 +607,8 @@ class ImageViewer(QWidget):
         # Show suggested point cross when updating preview with points
         if hasattr(self, 'suggested_point') and self.suggested_point:
             row, col = self.suggested_point
-            cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
-            cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+            cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 255, 0), 2)
+            cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 255, 0), 2)
 
         self.update_display(overlay_image)
 
@@ -1116,8 +1116,8 @@ class ImageViewer(QWidget):
             # Always show suggested point (arrow/cross) during labeling
             if hasattr(self, 'suggested_point') and self.suggested_point:
                 row, col = self.suggested_point
-                cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
-                cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+                cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 255, 0), 2)
+                cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 255, 0), 2)
         
         # Update the display
         self.update_display(overlay_image)
@@ -1162,8 +1162,8 @@ class ImageViewer(QWidget):
                 # Add suggested point if it exists
                 if hasattr(self, 'suggested_point') and self.suggested_point and self.current_mode == "creation":
                     row, col = self.suggested_point
-                    cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
-                    cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+                    cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 255, 0), 2)
+                    cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 255, 0), 2)
                     
                 # Update the display
                 self.update_display(overlay_image)
@@ -1206,8 +1206,8 @@ class ImageViewer(QWidget):
             # Show suggested point when hovering over buttons
             if hasattr(self, 'suggested_point') and self.suggested_point and self.current_mode == "creation":
                 row, col = self.suggested_point
-                cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
-                cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+                cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 255, 0), 2)
+                cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 255, 0), 2)
             
             self.update_display(overlay_image)
             return
@@ -1238,8 +1238,8 @@ class ImageViewer(QWidget):
             # Show suggested point when hovering over buttons
             if hasattr(self, 'suggested_point') and self.suggested_point:
                 row, col = self.suggested_point
-                cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
-                cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+                cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 255, 0), 2)
+                cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 255, 0), 2)
             
             self.update_display(overlay_image)
         else:
@@ -1251,8 +1251,8 @@ class ImageViewer(QWidget):
             # Show suggested point when hovering over buttons
             if hasattr(self, 'suggested_point') and self.suggested_point:
                 row, col = self.suggested_point
-                cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
-                cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+                cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 255, 0), 2)
+                cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 255, 0), 2)
             
             self.update_display(overlay_image)
 
@@ -1314,8 +1314,8 @@ class ImageViewer(QWidget):
         # Always show suggested point arrow/cross during labeling
         if hasattr(self, 'suggested_point') and self.suggested_point:
             row, col = self.suggested_point
-            cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
-            cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+            cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 255, 0), 2)
+            cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 255, 0), 2)
 
         self.update_display(overlay_image)
 
@@ -1353,8 +1353,8 @@ class ImageViewer(QWidget):
         # Show suggested point cross during negative point expansion too
         if hasattr(self, 'suggested_point') and self.suggested_point:
             row, col = self.suggested_point
-            cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 0, 0), 2)
-            cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 0, 0), 2)
+            cv2.line(overlay_image, (col, row - 6), (col, row + 6), (255, 255, 0), 2)
+            cv2.line(overlay_image, (col - 6, row), (col + 6, row), (255, 255, 0), 2)
 
         self.update_display(overlay_image)
 
@@ -1424,7 +1424,7 @@ class ImageViewer(QWidget):
         if overlay_point:
             row, col = overlay_point
             line_length = 6
-            line_color = (255, 0, 0)
+            line_color = (255, 255, 0)
             line_thickness = 2
             cv2.line(image, (col, row - line_length), (col, row + line_length), line_color, line_thickness)
             cv2.line(image, (col - line_length, row), (col + line_length, row), line_color, line_thickness)
