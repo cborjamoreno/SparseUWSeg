@@ -935,10 +935,12 @@ class ImageViewer(QWidget):
             # Create union of masks
             union_mask = np.logical_or(existing_mask, new_mask).astype(np.uint8)
 
-            # Remove all masks with the same label (to avoid double-counting)
-            self.expanded_masks = [m for m in self.expanded_masks if m[1] != existing_label]
-            # Add the union mask
-            self.expanded_masks.append((union_mask, existing_label, existing_color))
+            # Replace only the selected mask (mask_index) with the union, keep other masks of the same label
+            if 0 <= mask_index < len(self.expanded_masks):
+                self.expanded_masks[mask_index] = (union_mask, existing_label, existing_color)
+            else:
+                # Fallback: if index is invalid, just append
+                self.expanded_masks.append((union_mask, existing_label, existing_color))
             
             # Regenerate combined overlay
             self.regenerate_combined_mask_overlay()
