@@ -17,6 +17,24 @@ from skimage.measure import perimeter
 from sklearn.cluster import KMeans
 
 
+# ================= Selection parameters (easy to tweak) =================
+# Edit this one line to adapt behavior globally for prediction.
+# Weights for (SAM score, compactness, size penalty)
+# Meaning of weights and effect of increasing them:
+# - w_sam_score: Trust SAM's own mask score more. Higher => prefers masks the model is confident in
+#                 (even if larger or less compact).
+# - w_compactness: Prefer smoother, compact shapes. Higher => discourages ragged/leaky contours;
+#                  too high can trim thin/sinuous structures.
+# - w_size_penalty: Discourage large masks. Higher => favors smaller selections from a click;
+#                   too high can bias toward tiny fragments.
+# Tip: Adjust in small steps (±0.2–0.5) and validate on a few clicks.
+SELECTION_WEIGHTS = (1.0, 0.8, 1.4)
+
+# Tip for medical images (favor small, compact masks):
+# SELECTION_WEIGHTS = (0.9, 1.2, 3.0)
+# ======================================================================
+
+
 class Segmenter:
     def __init__(self, image=None, sam2_checkpoint_path=None, sam2_config_path=None, device="cuda"):
         """
@@ -203,14 +221,21 @@ class Segmenter:
         total_pixels = self.height * self.width
         normalized_area = mask_area / total_pixels  # Fraction of the image covered by the mask
 
-        # Gentle penalty for very small masks (e.g., < 1% of image)
-        if normalized_area < 0.001:  # Only apply penalty for masks smaller than 1% of the image
-            small_mask_penalty = normalized_area ** 4  # Soft quadratic penalty
+        # Gentle penalty for very small masks (fixed defaults)
+        SMALL_MASK_THRESHOLD_FIXED = 0.001
+        SMALL_MASK_PENALTY_POWER_FIXED = 4
+        if normalized_area < SMALL_MASK_THRESHOLD_FIXED and SMALL_MASK_THRESHOLD_FIXED > 0:
+            small_mask_penalty = normalized_area ** SMALL_MASK_PENALTY_POWER_FIXED
         else:
-            small_mask_penalty = 0  # No penalty for larger masks
+            small_mask_penalty = 0
 
         # Large mask penalty
-        large_mask_penalty = (normalized_area - 0.4) ** 4 if normalized_area > 0.5 else 0
+        LARGE_MASK_THRESHOLD_FIXED = 0.5
+        LARGE_MASK_PENALTY_POWER_FIXED = 4
+        if normalized_area > LARGE_MASK_THRESHOLD_FIXED:
+            large_mask_penalty = (normalized_area - max(0.4, LARGE_MASK_THRESHOLD_FIXED)) ** LARGE_MASK_PENALTY_POWER_FIXED
+        else:
+            large_mask_penalty = 0
 
         # Combine penalties gently
         size_penalty = normalized_area + small_mask_penalty + large_mask_penalty
@@ -218,14 +243,18 @@ class Segmenter:
         # Return normalized metrics
         return compactness, size_penalty, score
 
-    def _weighted_mask_selection(self, masks, scores, weights=(1.0, 0.8, 1.4), point=None, label=None):
+    def _weighted_mask_selection(self, masks, scores, weights=None, point=None, label=None):
         best_score = -np.inf
         best_index = -1  # Initialize with an invalid index
 
-        w_s, w_c, w_a = weights  # Weights for SAM Score, Compactness, and Size
+        # Weights for SAM Score, Compactness, and Size
+        if weights is None:
+            w_s, w_c, w_a = SELECTION_WEIGHTS
+        else:
+            w_s, w_c, w_a = weights
 
         for i, mask in enumerate(masks):
-            # Compute metrics
+            # Compute metrics using module-level parameters
             compactness, size_penalty, sam_score = self._compute_mask_metrics(mask, scores[i])
 
             # Weighted score (nonlinear terms)
@@ -274,8 +303,9 @@ class Segmenter:
             multimask_output=True,
         )
 
+        # Select using the shared weighted selection (uses module-level parameters)
         predicted_mask = masks[self._weighted_mask_selection(masks, scores)]
-        
+
         return predicted_mask.astype(bool)
     
     def cleanup(self):
