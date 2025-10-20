@@ -27,13 +27,8 @@ from sklearn.cluster import KMeans
 #                  too high can trim thin/sinuous structures.
 # - w_size_penalty: Discourage large masks. Higher => favors smaller selections from a click;
 #                   too high can bias toward tiny fragments.
-# Tip: Adjust in small steps (±0.2–0.5) and validate on a few clicks.
+
 SELECTION_WEIGHTS = (1.0, 0.8, 1.4)
-
-# Tip for medical images (favor small, compact masks):
-# SELECTION_WEIGHTS = (0.9, 1.2, 3.0)
-# ======================================================================
-
 
 class Segmenter:
     def __init__(self, image=None, sam2_checkpoint_path=None, sam2_config_path=None, device="cuda"):
