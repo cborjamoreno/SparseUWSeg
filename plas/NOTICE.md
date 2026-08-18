@@ -26,6 +26,12 @@ Upstream ships as a set of scripts — no `setup.py`, no `pyproject.toml` — so
 nothing to `pip install`, and the files here carry modifications besides. Unlike SAM 2,
 which this repo now takes as a pinned dependency, PLAS has to travel with the code.
 
+## The checkpoint
+
+`checkpoints/download_ckpts.sh` also fetches `standardization_C=100_step70000.pth`, the
+pretrained SSN feature extractor these superpixels rely on. That weight file is the PLAS
+authors', distributed from their Google Drive, and is covered by the same licence.
+
 ## What is here, and what we changed
 
 Modified by the SSeg authors, 2025–2026. Per file:

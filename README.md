@@ -150,9 +150,11 @@ These keys can be used inside the experiment dictionary in `run.py`:
 ## 📜 License
 This work is under AGPL-3.0 license.
 
-`plas/` is third-party: **Point Label Aware Superpixels** by Raine et al., GPL-3.0, with
-our modifications. See `plas/NOTICE.md` for provenance, the changes and the citation.
-SAM 2 (Meta, Apache-2.0) is a pinned dependency, used unmodified.
+Third-party material, each with its own terms and citation:
+- `plas/` — **Point Label Aware Superpixels** (Raine et al.), GPL-3.0, with our
+  modifications. See `plas/NOTICE.md`.
+- `demo/` — six tiles from the **UCSD Mosaics** dataset. See `demo/NOTICE.md`.
+- SAM 2 (Meta, Apache-2.0) — a pinned dependency, used unmodified.
  
 ## 📝 Citation
 ```bibtex
