@@ -1,3 +1,8 @@
+# Derived from Point Label Aware Superpixels (Raine et al.), GPL-3.0:
+#   https://github.com/sgraine/point-label-aware-superpixels  @ 6049fe4
+# Modified by the SSeg authors, 2025-2026: device-correct meshgrid; torch_scatter removed.
+# See NOTICE.md in this directory for the full list of changes and the licence.
+
 ##### spixel_utils #####
 # This script contains utility functions including:
 #

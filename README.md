@@ -148,7 +148,11 @@ These keys can be used inside the experiment dictionary in `run.py`:
 
 
 ## 📜 License
- This work is under AGPL-3.0 license.
+This work is under AGPL-3.0 license.
+
+`plas/` is third-party: **Point Label Aware Superpixels** by Raine et al., GPL-3.0, with
+our modifications. See `plas/NOTICE.md` for provenance, the changes and the citation.
+SAM 2 (Meta, Apache-2.0) is a pinned dependency, used unmodified.
  
 ## 📝 Citation
 ```bibtex
