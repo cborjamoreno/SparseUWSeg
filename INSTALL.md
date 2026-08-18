@@ -180,9 +180,11 @@ Usually a color-dict mismatch with the GT masks. Make sure
 `demo/color_dict.json` corresponds to the colors in `demo/labels/*.png`.
 
 ### `ModuleNotFoundError: No module named 'sam2'`
-You're running from the wrong directory. `cd` into the SSeg repo root
-before invoking `python run.py` (or `app.py`); the local `sam2/` package
-is on `sys.path` only when CWD is the repo root.
+SAM 2 is a dependency, not part of this repo. Install it with the rest:
+
+```bash
+pip install -r requirements.txt
+```
 
 ### Hydra / config errors on SAM2 init
 A common cause is an incomplete checkpoint download. Verify the file size:

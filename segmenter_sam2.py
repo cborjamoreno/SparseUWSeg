@@ -72,8 +72,17 @@ class Segmenter:
         self.selected_points = []
         self.rejected_masks = set()
 
-        return self.masks, self.predictor.get_features()[0]
+        return self.masks, self._image_embedding()[0]
     
+    def _image_embedding(self):
+        """Image embedding SAM 2 computed for the currently set image, [1, C, H, W].
+
+        Reads what predict() already produced, so SAM 2 itself needs no patching.
+        """
+        if not self.predictor._is_image_set:
+            raise RuntimeError("An image must be set with set_image(...) first.")
+        return self.predictor._features["image_embed"]
+
     def just_set_image(self, image):
         """
         Set a new image for the Segmenter without reinitializing the SAM2 model.
@@ -115,7 +124,7 @@ class Segmenter:
         self.sam2_model.to(self.device)
              
         # Generate masks
-        masks = self.mask_generator.generate(self.image)[0]
+        masks = self.mask_generator.generate(self.image)
 
         # Image area (width x height)
         image_area = self.image.shape[0] * self.image.shape[1]

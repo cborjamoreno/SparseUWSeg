@@ -1,8 +1,12 @@
 # SSeg dependencies — install AFTER installing torch+torchvision matching
 # your CUDA driver. See INSTALL.md for the torch install step.
 #
-# Pinning rationale: lower bounds only. Anything tighter ages badly across
+# Pinning rationale: lower bounds only, except SAM 2, whose commit is pinned because
+# it is the version this was developed against. Anything tighter ages badly across
 # CUDA / driver variants.
+
+# SAM 2 (Meta, Apache-2.0), used unmodified.
+sam2 @ git+https://github.com/facebookresearch/sam2.git@c2ec8e14a185632b0a5d8b161928ceb50197eddc
 
 opencv-python>=4.8.0
 scikit-learn>=1.3.0
