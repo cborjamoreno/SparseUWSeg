@@ -1,8 +1,10 @@
 #!/bin/bash
 
-# Download only the large SAM checkpoint and a Google Drive hosted standardization file.
-# Usage: edit the GOOGLE_DRIVE_ID variable below with the file id from the drive share URL
-# (the part after "id=" or the file/d/<>/view path), then run this script.
+# Downloads the PLAS standardization checkpoint, which is not available anywhere else.
+#
+# SAM 2's weights are NOT needed here: they are pulled from the Hugging Face Hub on first
+# use and cached under HF_HOME. Pass --with-sam2 to fetch a local copy anyway, for offline
+# runs — then hand it to the Segmenter via sam2_checkpoint_path / sam2_config_path.
 
 set -euo pipefail
 
@@ -45,8 +47,13 @@ download_if_missing() {
     fi
 }
 
-# 1) Download large SAM checkpoint
-download_if_missing "$SAM2P1_LARGE_URL" "$SAM2P1_LARGE_DEST"
+# 1) SAM 2 checkpoint — only when asked for; normally the Hub provides it
+if [[ "${1:-}" == "--with-sam2" ]]; then
+    download_if_missing "$SAM2P1_LARGE_URL" "$SAM2P1_LARGE_DEST"
+else
+    echo "Skipping SAM 2 checkpoint (fetched from the Hugging Face Hub on first use)."
+    echo "  Pass --with-sam2 to download it locally for offline use."
+fi
 
 # 2) Download Google Drive file (prefer gdown if available)
 download_gdrive() {

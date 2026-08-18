@@ -154,8 +154,8 @@ class AutoLabeler:
                  images_dir,
                  ground_truth_dir=None,  # Optional
                  output_dir=None,
-                 sam2_checkpoint="checkpoints/sam2.1_hiera_large.pt",
-                 sam2_config="configs/sam2.1/sam2.1_hiera_l.yaml",
+                 sam2_checkpoint=None,   # None -> weights from the Hugging Face Hub
+                 sam2_config=None,
                  save_visualizations=False,
                  debug_save_expanded_masks=False,
                  device="cuda",

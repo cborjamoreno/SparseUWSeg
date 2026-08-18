@@ -157,7 +157,7 @@ Install OK.
 
 Next steps:
   conda activate $ENV_NAME
-  bash checkpoints/download_ckpts.sh   # ~900 MB SAM2 checkpoint
+  bash checkpoints/download_ckpts.sh   # PLAS checkpoint (SAM 2 comes from the Hub)
   python run.py                        # runs the demo experiment
 
 ================================================================

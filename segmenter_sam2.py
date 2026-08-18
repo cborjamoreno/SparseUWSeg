@@ -10,19 +10,28 @@ import contextlib
 # Add the current directory to the Python path to find the local segment_anything folder
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from sam2.build_sam import build_sam2
+from sam2.build_sam import build_sam2, build_sam2_hf
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from skimage.measure import perimeter
 from sklearn.cluster import KMeans
 
 
+DEFAULT_SAM2_MODEL_ID = "facebook/sam2.1-hiera-large"
+
+
 class Segmenter:
-    def __init__(self, image=None, sam2_checkpoint_path=None, sam2_config_path=None, device="cuda"):
+    def __init__(self, image=None, sam2_model_id=DEFAULT_SAM2_MODEL_ID,
+                 sam2_checkpoint_path=None, sam2_config_path=None, device="cuda"):
         """
         Initialize the Segmenter class with SAM2, optionally without an image.
+
+        Weights come from the Hugging Face Hub by default and are cached under HF_HOME,
+        so no checkpoint file has to be placed by hand. Passing both
+        sam2_checkpoint_path and sam2_config_path loads a local checkpoint instead.
         """
         self.device = "cuda" if torch.cuda.is_available() and device == "cuda" else "cpu"
+        self.sam2_model_id = sam2_model_id
         self.sam2_checkpoint_path = sam2_checkpoint_path
         self.sam2_config_path = sam2_config_path
         self.sam2_model = None
@@ -330,9 +339,15 @@ class Segmenter:
                 self.autocast_context = contextlib.nullcontext()
                 self.autocast_context.__enter__()
 
-            self.sam2_model = build_sam2(
-                self.sam2_config_path, self.sam2_checkpoint_path, device=self.device, apply_postprocessing=False
-            )
+            if self.sam2_checkpoint_path and self.sam2_config_path:
+                self.sam2_model = build_sam2(
+                    self.sam2_config_path, self.sam2_checkpoint_path,
+                    device=self.device, apply_postprocessing=False
+                )
+            else:
+                self.sam2_model = build_sam2_hf(
+                    self.sam2_model_id, device=self.device, apply_postprocessing=False
+                )
 
             self.mask_generator = SAM2AutomaticMaskGenerator(
                 model=self.sam2_model,

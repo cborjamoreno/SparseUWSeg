@@ -28,7 +28,7 @@ checkpoint.
 | CUDA driver | ≥ 11.8 (check with `nvidia-smi`)         |
 | Python      | 3.10                                     |
 | conda       | miniconda or anaconda                    |
-| Disk        | ~5 GB (env + 900 MB SAM2 checkpoint)     |
+| Disk        | ~5 GB (env + ~900 MB of cached model weights) |
 
 CPU-only is supported but slow — every `run.py` invocation falls back
 automatically if CUDA is unavailable.
@@ -53,7 +53,7 @@ git clone <repo-url> SSeg
 cd SSeg
 bash setup.sh              # creates conda env "spuw", installs everything
 conda activate spuw
-bash checkpoints/download_ckpts.sh    # downloads SAM2 checkpoint (~900 MB)
+bash checkpoints/download_ckpts.sh    # PLAS checkpoint; SAM 2 comes from the Hub
 python run.py              # runs the demo experiment
 ```
 
@@ -120,8 +120,10 @@ bash download_ckpts.sh
 cd ..
 ```
 
-This pulls `sam2.1_hiera_large.pt` (~900 MB) and a standardization weights
-file from Google Drive. Requires `wget` or `curl`.
+This pulls the PLAS standardization weights file from Google Drive. Requires
+`wget` or `curl`. SAM 2's weights are not needed here — they come from the
+Hugging Face Hub on first use. Pass `--with-sam2` to fetch them locally for
+offline runs.
 
 ### 5. Smoke test
 
@@ -189,11 +191,13 @@ pip install -r requirements.txt
 ### Hydra / config errors on SAM2 init
 A common cause is an incomplete checkpoint download. Verify the file size:
 
-```bash
-ls -lh checkpoints/sam2.1_hiera_large.pt   # should be ~900 MB
-```
+SAM 2's weights are downloaded from the Hugging Face Hub on first use and cached
+under `HF_HOME`, so there is no checkpoint file to verify. If the download was
+interrupted, clear the cache entry and let it fetch again:
 
-If it's much smaller, re-run `download_ckpts.sh`.
+```bash
+rm -rf ~/.cache/huggingface/hub/models--facebook--sam2.1-hiera-large
+```
 
 ---
 

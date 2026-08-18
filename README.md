@@ -48,7 +48,7 @@ the manual walkthrough and troubleshooting.
 ```bash
 bash setup.sh                            # creates conda env "spuw", auto-detects CUDA
 conda activate spuw
-bash checkpoints/download_ckpts.sh       # ~900 MB SAM2 checkpoint
+bash checkpoints/download_ckpts.sh       # PLAS checkpoint (SAM 2 comes from the Hub)
 python run.py                            # smoke-tests the demo experiment
 ```
 

@@ -452,9 +452,9 @@ class ImageViewer(QWidget):
         print(f"  - combined_mask_overlay: {combined_mask_overlay_mb:.4f} MB")
 
     def initialize_segmenter_and_start_thread(self, wait_dialog):
-        sam2_checkpoint = "checkpoints/sam2.1_hiera_large.pt"
-        # sam_checkpoint = "checkpoints/vit_b_coralscop.pth"
-        sam2_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        # None -> SAM 2 weights are fetched from the Hugging Face Hub and cached
+        sam2_checkpoint = None
+        sam2_cfg = None
         current_image_path = self.image_list[self.current_index]
 
         image = self._load_and_normalize_image(current_image_path)

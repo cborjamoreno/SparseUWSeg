@@ -4,3 +4,4 @@ labeled_masks/
 __pycache__/
 experiments/
 app_annotations/
+.idea/
